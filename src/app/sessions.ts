@@ -53,13 +53,14 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 /**
- * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
- * subagents. It gets no other tool the profile has, whenever it was registered: none that asks or shows a person something,
- * changes the profile, schedules work or starts goals outside the worker slots, the pause and a person's hold, starts or
- * messages other Sessions, or edits documents.
+ * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills and its todo list. It
+ * gets no other tool the profile has, whenever it was registered: none that asks or shows a person something, changes the
+ * profile, schedules work or starts goals outside the worker slots, the pause and a person's hold, starts a subagent or
+ * messages another Session, or edits documents. A worker talks to the Router through its own `orchestrator_*` tools, which
+ * the ticket adds; it does not spawn or message Sessions of its own.
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
-  'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+  'web_fetch', 'skill', 'todo_write']
 /**
  * Tools the router conversation keeps. It routes; it does not work. No shell, no job control, no writes: the only way it can
  * change anything is through its own `orchestrator_*` tools, which act on Tickets and other conversations. `read` stays for
@@ -147,17 +148,20 @@ export class Sessions {
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   /**
    * Ensures a Session exists.
-   * @param cwd - its directory; the `workspaceId` overrides which Workspace it joins, so the router conversation can join the
-   * one the client already opens instead of making another Workspace for the same directory.
+   * @param cwd - its directory; the `workspaceId` overrides which Workspace it joins, so a person finds the conversation in
+   * the Workspace they have open instead of one made per ticket directory. The directory itself still comes from `cwd`.
    */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker',
     workspaceId?: string): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
-      const workspace = workspaceId ? { id: workspaceId } : await ctx.workspaceRegistry.create(cwd)
+      // A worker conversation belongs in the Workspace the client shows, like the router's: a person has to be able to open
+      // it. Only a host with no Workspace at all falls back to one made from the ticket directory.
+      const joining = workspaceId ?? (await this.defaultWorkspace())?.id
+      const workspace = joining ? { id: joining } : await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id as never,
+      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id as never, cwd,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
@@ -196,6 +200,18 @@ export class Sessions {
       this.releaseBorrowed(agent)
       throw error
     }
+  }
+  /**
+   * The directory of the Workspace the client actually shows as the default. `initializeDefault` is the host's own answer to
+   * that question; the list order is not, because a Workspace created for some other Session can come first.
+   */
+  async defaultWorkspace(): Promise<{ id: string; path?: string } | undefined> {
+    try {
+      const preferred = await this.ctx.workspaceRegistry.initializeDefault(async () => process.cwd()).catch(() => undefined)
+      if (preferred) return preferred
+      const listed = [...await this.ctx.workspaceRegistry.list()]
+      return listed.find(item => item.path?.toLowerCase() === process.cwd().toLowerCase()) ?? listed[0]
+    } catch { return undefined }
   }
   /** Remove ticket tools when a loan ends without disposing the person's conversation. */
   releaseTicket(ticketId: string): void {

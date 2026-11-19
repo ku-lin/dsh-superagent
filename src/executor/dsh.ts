@@ -27,6 +27,12 @@ export const workerSessionId = (ticketId: string): string => `worker-${ticketId}
 export const ticketOfSession = (sessionId: string): string | undefined => sessionId.startsWith('worker-') ? sessionId.slice('worker-'.length) : undefined
 /** A loan never changes the conversation's owner or session settings. */
 export const executionSessionId = (ticket: Ticket): string => ticket.execution?.borrowedSession?.sessionId ?? workerSessionId(ticket.id)
+/**
+ * The title a worker conversation carries in the Workspace: `worker-<id8> · <ticket title>`, so a person scrolling the list
+ * can tell which conversation works on what, and open it like any other conversation.
+ */
+export const workerTitle = (ticket: Pick<Ticket, 'id' | 'title'>): string =>
+  `worker-${ticket.id.replace(/^t[-_]/i, '').slice(0, 8)} · ${ticket.title}`
 /** Maximum runtime for a workspace prepare command. */
 const PREPARE_TIMEOUT_MS = 10 * 60_000
 /** Maximum transient retry attempts for a launch or worker turn, and the initial backoff before resuming a turn. */
@@ -325,7 +331,7 @@ export class DshExecutor implements Executor {
         try {
           // Only owned worker sessions may be recreated; a missing loan fails delivery.
           if (!ticket.execution?.borrowedSession && !this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', workerTitle(ticket), 'worker')
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -463,7 +469,7 @@ export class DshExecutor implements Executor {
         if ('error' in result) throw result.error
         return result.agent
       })
-      : await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+      : await this.host.sessions.ensure(sessionId, workspace, workerTitle(ticket), 'worker')
     if (!current()) return
     if (ticket.execution?.borrowedSession) await this.host.sessions.borrow(agent, ticket)
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.

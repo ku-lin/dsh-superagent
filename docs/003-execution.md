@@ -26,25 +26,29 @@ Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory 
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. A worker is an ordinary conversation in the Workspace the client shows, titled `worker-<id> · <ticket title>`; it works in the Ticket's own directory. It does not spawn subagents: it reports through the Ticket's `orchestrator_*` tools, and the Router talks to it with `orchestrator_worker_message`.
 
 ### Background work and worker slots
 
-When a turn ends with shell jobs or subagents still running, the Ticket keeps its worker slot and stays working. It is not reported as waiting, and the main Session receives no waiting report. A completed job or subagent wakes the Executor with its result in the same slot. Once a turn ends with no background work, the Executor reports waiting normally.
+When a turn ends with shell jobs still running, the Ticket keeps its worker slot and stays working. It is not reported as waiting, and the main Session receives no waiting report. A completed job wakes the Executor with its result in the same slot. Once a turn ends with no background work, the Executor reports waiting normally.
 
-After each turn, background work has at most 30 minutes to finish. At that limit, shell jobs are killed and the Ticket is reported waiting. The report includes the Executor's last words and which jobs were killed or subagents remain active. Subagents are allowed to continue. The Executor reads killed-job results on its next turn.
+After each turn, background work has at most 30 minutes to finish. At that limit, shell jobs are killed and the Ticket is reported waiting. The report includes the Executor's last words and which jobs were killed. Subagents are not involved: a worker spawns none, and a leftover child of a borrowed conversation does not hold a Ticket open. The Executor reads killed-job results on its next turn.
 
 A handoff to a person frees the slot immediately and leaves the Report in effect. This applies after a `ready` Report or a question, unless another Input arrived since, and after any `blocked` or `failed` Report.
 
-At handoff, subagents stop. Shell jobs, such as a server offered for review, may continue until the Assignment ends. They hold no slot and are exempt from the 30-minute limit, including after later turns. Their completion does not wake the Executor; it reads the results on its next turn.
+At handoff, shell jobs are released. They hold no slot and are exempt from the 30-minute limit, including after later turns. Their completion does not wake the Executor; it reads the results on its next turn.
 
 A person can also start a turn by writing directly in the Executor Session. Its background work follows the same rules.
 
-When an Assignment ends, its shell jobs are killed without waking the Session. Its subagents are released, and any completion turns they wake are dropped. The replacement Assignment and its waiting Inputs start after that shutdown finishes.
+When an Assignment ends, its shell jobs are killed without waking the Session. The replacement Assignment and its waiting Inputs start after that shutdown finishes.
 
 Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; a process restart ends that work outright. An Assignment interrupted while busy restarts with a recovery note.
 
-Worker subagents, including nested ones, use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose those tools when the Ticket ends. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
+### Talking to a worker conversation
+
+The Router reaches a worker with `orchestrator_worker_list` (the conversations it may address, by title) and `orchestrator_worker_message`. By default the message is handed over and the call returns at once; the worker's answer comes back to the Router as an ordinary message in its own conversation once that turn ends, so the Router never sits on a timer. `wait_seconds` above zero only makes the round trip inline for a caller that wants it.
+
+A person can open the same conversation and type into it; the Ticket keeps its slot while the turn runs, exactly as for a message the Router sent.
 
 ### Preparing a Ticket directory
 

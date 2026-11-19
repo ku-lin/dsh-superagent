@@ -9,6 +9,53 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [1.2.0] - 2026-11-19
+
+A worker becomes an ordinary conversation you can find and talk to, and the Router
+talks to it instead of waiting on subagents. `engines.dsh`, the bundle id, the preset
+ids and the `/orchestrator/api/` paths are unchanged; there is no data migration.
+
+### Changed
+
+- **A worker conversation lives in the Workspace you have open.** `Sessions.ensure` joins
+  the Workspace the client shows as its default and keeps the ticket's directory as the
+  Session's `cwd`, instead of creating one Workspace per ticket directory. A worker is
+  titled `worker-<id8> · <ticket title>`, so it is findable in the list, openable, and
+  resumable like any other conversation.
+- **A worker spawns no subagents.** `subagent`, `list_subagent_models`, `send_message`,
+  `list_agents` and `interrupt_agent` are gone from `WORK_TOOLS`, and the worker preset
+  loses its delegation group. A worker reports through the ticket's own
+  `orchestrator_*` tools.
+- **A turn's end no longer waits on subagents.** `untilQuiet` only waits for the worker's
+  own shell jobs; a leftover child of a borrowed conversation cannot hold a ticket open,
+  and the 30-minute limit no longer reports "subagents still ran".
+- **The Router talks, it does not wait.** `orchestrator_worker_message` now defaults to
+  `wait_seconds: 0`: the message is handed over and the call returns at once, and the
+  worker's answer is delivered back into the Router's own conversation when that turn ends
+  (`answerLater`). A positive `wait_seconds` still asks for the answer inline.
+
+### Upgrade notes
+
+1. **Worker conversations move into your Workspace.** After the upgrade, open tickets
+   recreate their worker in the Workspace the client shows, not in a Workspace per ticket
+   directory. Conversations created by 1.1.0 stay where they are; new turns use the new
+   place. Nothing is deleted.
+2. **Workers can no longer spawn subagents.** A worker that used `subagent` will find the
+   tool gone; work that needs delegation must be split into tickets, or done by a person's
+   own session. Prompt text that mentions subagents in a worker has been removed.
+3. **`orchestrator_worker_message` changed meaning for its default.** Omitting
+   `wait_seconds` no longer blocks up to 120 s; it returns as soon as the message is
+   handed over, and the answer arrives later as a message in the Router's chat. Pass a
+   positive value to keep the old inline behaviour for a specific call.
+
+### Tests
+
+`bundle-patch.spec.ts` now requires the worker preset to have no delegation tools;
+`runtime-concurrency.spec.ts` gained a workspace/name/message-contract group; the
+background and concurrency cases that encoded "a ticket waits for its worker's subagents"
+were re-specified to "a leftover child does not hold a ticket open", keeping the
+shell-job coverage. Nothing was skipped or deleted.
+
 ## [1.1.0] - 2026-11-19
 
 Merges the router panel work that was still uncommitted in the development tree, and

@@ -186,6 +186,26 @@ function answerAfter(agent: Agent, from: number): string {
   return last?.type === 'assistant/message'
     ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : ''
 }
+/**
+ * Hands the worker's answer back to the Router as an ordinary message in its own conversation, once that worker's turn ends.
+ * This is the inter-session conversation the Router runs on: no polling, no timer of its own, and the answer waits in the
+ * Router's inbox like any other message a person or a source sends it.
+ */
+async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, from: number, title: string,
+  signal: AbortSignal): Promise<void> {
+  const idle = (): boolean => worker.status === 'idle'
+  if (!idle()) {
+    // `whenIdle` resolves on the turn that is running; a worker already idle answers from what it has.
+    await Promise.race([worker.whenIdle(), new Promise<void>(resolve => {
+      signal.addEventListener('abort', () => resolve(), { once: true })
+    })])
+  }
+  if (signal.aborted) return
+  const reply = answerAfter(worker, from)
+  if (!reply) return
+  await host.sessions.prompt(router.id, key('worker-answer', worker.id, String(Date.now())),
+    `Answer from ${title}:\n${reply}`, 'queue').catch(() => { /* The Router's own turn may refuse it; the text stays in the worker. */ })
+}
 /** Resolves when the conversation's turn ends, or false on timeout or when the caller is cancelled. */
 async function untilIdle(agent: Agent, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
   const wait = (ms: number) => new Promise<boolean>(resolve => { setTimeout(() => resolve(false), ms) })
@@ -368,8 +388,8 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         title: z.string().trim().min(1).optional().describe('The conversation\'s title, as orchestrator_worker_list reports it. Preferred over session.'),
         session: z.string().min(1).optional().describe('The conversation\'s session id, for a blank or ambiguous title.'),
         text: z.string().trim().min(1).max(8000).describe('What to say, in the conversation\'s own language.'),
-        wait_seconds: z.number().int().min(0).max(600).default(120)
-          .describe('How long to wait for that conversation\'s turn to end; 0 only delivers it.'),
+        wait_seconds: z.number().int().min(0).max(600).default(0)
+          .describe('0 delivers the message and returns at once, and the answer arrives later as a message in this conversation; a positive value also waits that long for the turn to end.'),
       }).strict(),
       execute: async (args, signal) => {
         const target = await resolveWorker(host, agent, args.title, args.session)
@@ -380,7 +400,13 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const worker = resolved.agent
         const from = worker.session.snapshotEvents().length
         await host.sessions.prompt(sessionId, key('router-message', agent.id, String(Date.now())), args.text, 'queue')
-        if (args.wait_seconds === 0) return { session: sessionId, title, delivered: true, finished: false }
+        // The Router does not sit on a timer: by default it hands the message over and the answer comes back to this
+        // conversation when the worker's turn ends. A positive `wait_seconds` only shortens the round trip for a caller that
+        // wants the answer inline.
+        if (args.wait_seconds === 0) {
+          void answerLater(host, agent, worker, from, title, signal)
+          return { session: sessionId, title, delivered: true, finished: false }
+        }
         const finished = await untilIdle(worker, args.wait_seconds * 1000, signal)
         const reply = answerAfter(worker, from)
         return { session: sessionId, title, delivered: true, finished, ...(reply ? { reply } : {}) }
