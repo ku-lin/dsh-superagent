@@ -105,6 +105,147 @@ it('runs prepare commands in the background, side by side, while accepts, intake
   expect(h.runtime.store.tickets.list().map(ticket => ticket.assignments.at(-1)!.state)).toEqual(['running', 'running'])
 })
 
+it('borrows an idle ordinary Session with ticket tools without changing its existing tools', async () => {
+  await h.controller.create({ sessionId: 'human-1' })
+  h.tools.get('human-1')!.set('existing_tool', { name: 'existing_tool', execute: async () => 'existing' })
+  Object.assign(h.controller, { list: vi.fn(async () => ({ items: [
+    { sessionId: 'human-1', agentAvailable: true, running: false, origin: 'user', updatedAt: 1 },
+  ] })) })
+  const trigger = feishu('1', '@bot 修一')
+  h.runtime.receive(trigger); await h.runtime.idle()
+  await h.runtime.settings.pause(true, 'panel')
+  const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+  expect(await h.api('POST', `tickets/${ticketId}/worker-session`, { sessionId: 'human-1' })).toMatchObject({ status: 200 })
+  await h.runtime.settings.pause(false, 'panel'); await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(ticketId)?.execution?.borrowedSession?.sessionId).toBe('human-1')
+  expect(h.tools.get('human-1')?.has('existing_tool')).toBe(true)
+  expect(h.tools.get('human-1')?.has('orchestrator_report')).toBe(true)
+  const retainedTool = h.tools.get('human-1')!.get('orchestrator_report')!
+  const borrowedAgent = h.agents.get('human-1')!
+  const borrowedTicket = h.runtime.store.tickets.get(ticketId)!
+  await expect(h.runtime.sessions.borrow(borrowedAgent as never, { ...borrowedTicket, id: 'another-open-ticket' })).rejects.toThrow('another open borrowed ticket')
+  const combined = vi.spyOn(AbortSignal, 'any')
+  expect(await h.runTool('human-1', 'orchestrator_report', { state: 'blocked', summary: 'Need a decision' }))
+    .toMatchObject({ reported: true })
+  const loanSignal = combined.mock.results.at(-1)?.value as AbortSignal
+  expect(loanSignal.aborted).toBe(false)
+  expect(() => h.runtime.store.atomic(() => { h.runtime.engine.stopTicket(ticketId); throw new Error('rolled back') })).toThrow('rolled back')
+  expect(loanSignal.aborted).toBe(false)
+  expect(h.tools.get('human-1')?.has('orchestrator_report')).toBe(true)
+  expect(h.runtime.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  h.runtime.engine.stopTicket(ticketId)
+  expect(loanSignal.aborted).toBe(true)
+  combined.mockRestore()
+  expect(h.tools.get('human-1')?.has('orchestrator_report')).toBe(false)
+  expect(() => retainedTool.execute({ state: 'blocked', summary: 'late action' }, { signal: new AbortController().signal }))
+    .toThrow('Borrowed ticket ended')
+  expect(h.tools.get('human-1')?.has('existing_tool')).toBe(true)
+  expect(await h.api('GET', 'dsh-sessions')).toMatchObject({ status: 200,
+    body: { items: [expect.not.objectContaining({ leasedToTicketId: ticketId })] } })
+})
+
+it('cancels a borrowed conversation\'s in-flight resource read when its ticket ends', async () => {
+  await h.controller.create({ sessionId: 'human-1' })
+  Object.assign(h.controller, { list: vi.fn(async () => ({ items: [
+    { sessionId: 'human-1', agentAvailable: true, running: false, origin: 'user', updatedAt: 1 },
+  ] })) })
+  const trigger = feishu('1', '@bot 修一')
+  h.runtime.receive(trigger); await h.runtime.idle()
+  await h.runtime.settings.pause(true, 'panel')
+  const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+  expect(await h.api('POST', `tickets/${ticketId}/worker-session`, { sessionId: 'human-1' })).toMatchObject({ status: 200 })
+  await h.runtime.settings.pause(false, 'panel'); await h.runtime.idle()
+  // The read waits inside the command, whose signal is the loan's: only the borrowed tool's signal can end it.
+  let reading = false
+  vi.mocked(Commands.prototype.gh).mockImplementation(async function (this: Commands, args: string[]) {
+    if (!args.some(arg => arg.includes('pulls/42'))) return { default_branch: 'master', permissions: { push: true } }
+    reading = true
+    const signal = (this as unknown as { signal: AbortSignal }).signal
+    return await new Promise<never>((_resolve, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }) })
+  })
+  const read = h.runTool('human-1', 'orchestrator_read', { resource: 'github/pulls/42' })
+  await waitUntil(() => reading)
+  expect(h.runtime.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  h.runtime.engine.stopTicket(ticketId)
+  await expect(read).rejects.toThrow('Borrowed ticket ended')
+})
+
+it('lets the Router conversation list other conversations and command one, returning its answer', async () => {
+  await h.controller.create({ sessionId: 'human-1' })
+  const worker = h.agents.get('human-1')!
+  const events: unknown[] = []
+  ;(worker as unknown as { session: { snapshotEvents: () => unknown[] } }).session.snapshotEvents = () => events
+  Object.assign(h.controller, { list: vi.fn(async () => ({ items: [
+    { sessionId: 'human-1', agentAvailable: true, running: false, origin: 'user', updatedAt: 1 },
+    { sessionId: h.runtime.masterId, agentAvailable: true, running: false, origin: 'user', updatedAt: 1 },
+  ] })) })
+  // The Router's own conversation is not one of its workers.
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_worker_list', {})).toMatchObject({ items: [
+    { session: 'human-1', running: false, available: true }] })
+  const sent = h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { session: 'human-1', text: '把 README 改一下', wait_seconds: 5 })
+  await waitUntil(() => h.deliveries.mock.calls.some(([call]) => call.sessionId === 'human-1' && call.text === '把 README 改一下'))
+  events.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '改好了' }] } } })
+  worker.status = 'idle'
+  await expect(sent).resolves.toMatchObject({ session: 'human-1', delivered: true, finished: true, reply: '改好了' })
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { session: h.runtime.masterId, text: 'x', wait_seconds: 0 }))
+    .resolves.toMatchObject({ refused: expect.stringContaining('cannot message itself') })
+  // A person names the target by title; an unknown one is refused with what does exist, never delivered somewhere else.
+  Object.assign(h.controller, { list: vi.fn(async () => ({ items: [
+    { sessionId: 'human-1', title: '取证ag', agentAvailable: true, running: false, origin: 'user', updatedAt: 2 },
+  ] })) })
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { title: '取证ag', text: '跑一下测试', wait_seconds: 0 }))
+    .resolves.toMatchObject({ session: 'human-1', title: '取证ag', delivered: true })
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { title: '不存在的对话', text: 'x', wait_seconds: 0 }))
+    .resolves.toMatchObject({ refused: expect.stringContaining('No conversation is titled') })
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { text: 'x', wait_seconds: 0 }))
+    .resolves.toMatchObject({ refused: expect.stringContaining('Name the conversation') })
+})
+
+it('gives the Router conversation no way to do the work itself, only to dispatch it', async () => {
+  await h.controller.create({ sessionId: 'human-1' })
+  await h.runtime.idle()
+  // The router keeps management tools only: no shell, no job control, no file writes. This is the rule that makes it a router.
+  const tools = h.tools.get(h.runtime.masterId)
+  expect(tools).toBeDefined()
+  for (const name of ['bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'write', 'edit', 'subagent']) {
+    expect(tools!.has(name), `${name} must not reach the Router`).toBe(false)
+  }
+  // And the tools that do reach it act on other conversations, not on files or commands.
+  expect(tools!.has('orchestrator_worker_message')).toBe(true)
+})
+
+it('does not silently reborrow a conversation when an ended ticket resumes', async () => {
+  await h.controller.create({ sessionId: 'human-1' })
+  Object.assign(h.controller, { list: vi.fn(async () => ({ items: [
+    { sessionId: 'human-1', agentAvailable: true, running: false, origin: 'user', updatedAt: 1 },
+  ] })) })
+  const trigger = feishu('1', '@bot 修一')
+  h.runtime.receive(trigger); await h.runtime.idle()
+  await h.runtime.settings.pause(true, 'panel')
+  const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+  expect(await h.api('POST', `tickets/${ticketId}/worker-session`, { sessionId: 'human-1' })).toMatchObject({ status: 200 })
+  await h.runtime.settings.pause(false, 'panel'); await h.runtime.idle()
+  await h.runTool('human-1', 'orchestrator_report', { state: 'ready', summary: 'Done.' })
+  expect(h.runtime.store.tickets.get(ticketId)?.ended).toBeDefined()
+  expect(h.tools.get('human-1')?.has('orchestrator_report')).toBe(false)
+  await h.runtime.settings.pause(true, 'panel')
+  h.runtime.receive(feishu('2', '再改一下', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+  await h.runtime.settings.pause(false, 'panel')
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await h.runtime.pump(); await h.runtime.idle() } finally { vi.useRealTimers() }
+  expect(h.runtime.store.tickets.get(ticketId)?.execution?.borrowedSession).toBeUndefined()
+  expect(h.runtime.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  expect(h.agents.get(`worker-${ticketId}`)).toBeDefined()
+  expect(h.tools.get('human-1')?.has('orchestrator_report')).toBe(false)
+  const page = await h.api('GET', `tickets/${ticketId}`)
+  expect(page).toMatchObject({ status: 200, body: { assignments: [
+    expect.objectContaining({ ref: 'human-1' }), expect.objectContaining({ ref: `worker-${ticketId}` }),
+  ] } })
+})
+
 it('keeps a launch that a pause cut short queued, and finishes it once processing resumes', async () => {
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'make worktree' } })

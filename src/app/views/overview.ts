@@ -35,7 +35,7 @@ export function evalsHealth(store: Store, now = Date.now()): Health {
  * Builds the operator overview: active system problems, tickets awaiting human action, executor load, and 24-hour trigger flow.
  * @param setup - Setup problem to surface first (where setup stopped, or a Source paused by setup).
  */
-export function overview(host: ViewHost, health: HealthMap, policyVersionValue: string, load: ExecutorLoad, setup?: SetupProblem) {
+export function overview(host: ViewHost, health: HealthMap, policyVersionValue: string, load: ExecutorLoad, setup?: SetupProblem, sourcelessMode = false) {
   const { store, sources } = host
   const view = snapshot(host)
   const settings = store.settings()
@@ -45,11 +45,14 @@ export function overview(host: ViewHost, health: HealthMap, policyVersionValue: 
   const running = instances.filter(instance => instance.enabled && instance.installed).map(instance => sourceHealth(sources, instance, health))
   // Exclude source-owned and policy-sync health entries so only core runtime errors surface as `runtime-error`.
   const sourceParts = new Set(instances.flatMap(instance => sources.kind(instance.kind)?.health ?? []))
+  // With no Source enabled at all, "nothing can open a Ticket" is the chosen state, not a problem to report: the Router
+  // conversation and worker control still work.
+  const sourceless = sourcelessMode || instances.every(instance => !instance.enabled)
   const problems = [
     ...(setup ? [{ kind: 'setup' as const, ...setup }] : []),
-    ...(running.length ? [] : [{ kind: 'no-source' as const }]),
+    ...(sourceless || running.length ? [] : [{ kind: 'no-source' as const }]),
     // Only allowed senders can originate work, so empty allowlists mean no request can ever become a ticket.
-    ...(anyoneAllowed(settings) ? [] : [{ kind: 'no-allowed' as const }]),
+    ...(sourceless || anyoneAllowed(settings) ? [] : [{ kind: 'no-allowed' as const }]),
     ...running.flatMap(source => source.health.filter(item => item.state === 'error').map(item => ({ kind: 'source-error' as const, source: { id: source.id, title: source.title, health: item } }))),
     ...(settings.paused ? [{ kind: 'executor-paused' as const }] : []),
     // Unavailable Evals behind the `evals` health entry are listed individually as `eval-unavailable` below.

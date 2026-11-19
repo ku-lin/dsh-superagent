@@ -3,12 +3,14 @@
 import { act } from 'react'
 import { expect, it } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field } from './fixtures/panel.tsx'
+import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { server } from './fixtures/panel-server.ts'
 
 usePanel()
 it('opens the Decisions under Policy from the flow line with their reasons, Decisions that start work first, filterable by kind',
   async () => {
+  // The panel opens on Router; the flow line with the Decision counters is on Overview.
+  at({ page: 'overview' })
   await mount()
   await click(all('.dt-stat button')[1]!)
   expect(tab(zh['tab.eval']).getAttribute('aria-selected')).toBe('true')

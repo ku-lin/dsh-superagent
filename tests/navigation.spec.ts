@@ -3,7 +3,7 @@ import { expect, it, vi } from 'vitest'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { openKnownSession } from '../src/navigation.ts'
-import { initialLocation, parseRoute, remember, setupPage } from '../src/client/route.ts'
+import { initialLocation, parseRoute, remember, ROUTE_KEY, setupPage } from '../src/client/route.ts'
 const id = 'orchestrator-test' as SessionId
 function fixture(ready = false) {
   const pending = Promise.withResolvers<void>()
@@ -39,16 +39,16 @@ it('does not navigate after the panel unmounts or a newer request supersedes it'
   controller.abort(); state.phase = 'ready'; state.byId[id] = {}; pending.resolve()
   await expect(navigation).resolves.toBe(false); expect(open).not.toHaveBeenCalled()
 })
-it('reopens the page this tab showed last, and the overview for a route that no longer exists', () => {
+it('reopens the page this tab showed last, and the home page for a route that no longer exists', () => {
   remember({ route: { page: 'eval', query: { filter: 'stop' } }, stack: [{ page: 'overview' }] })
   expect(initialLocation()).toEqual({ route: { page: 'eval', query: { filter: 'stop' } }, stack: [{ page: 'overview' }] })
-  // The Eval tab was previously named Policy; a route saved under the old name falls back to overview.
-  sessionStorage.setItem('dsh-superagent/route', JSON.stringify({ route: { page: 'policy' }, stack: [] }))
-  expect(initialLocation()).toEqual({ route: { page: 'overview' }, stack: [] })
-  sessionStorage.setItem('dsh-superagent/route', JSON.stringify({ route: { page: 'trigger', id: 'github:1' }, stack: [{ page: 'policy' }, { page: 'trigger' }] }))
+  // The Eval tab was previously named Policy; a route saved under the old name falls back to the home page, which is Router.
+  sessionStorage.setItem(ROUTE_KEY, JSON.stringify({ route: { page: 'policy' }, stack: [] }))
+  expect(initialLocation()).toEqual({ route: { page: 'worker' }, stack: [] })
+  sessionStorage.setItem(ROUTE_KEY, JSON.stringify({ route: { page: 'trigger', id: 'github:1' }, stack: [{ page: 'policy' }, { page: 'trigger' }] }))
   expect(initialLocation().stack).toEqual([{ page: 'trigger' }])
-  sessionStorage.setItem('dsh-superagent/route', '{')
-  expect(initialLocation().route).toEqual({ page: 'overview' })
+  sessionStorage.setItem(ROUTE_KEY, '{')
+  expect(initialLocation().route).toEqual({ page: 'worker' })
 })
 it('reads each page a tab remembered with the parameters it takes, and leaves out what it does not know', () => {
   expect(parseRoute({ page: 'trigger', query: { filter: 'nope', trigger: 'e1' } })).toEqual({ page: 'trigger' })

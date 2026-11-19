@@ -37,12 +37,17 @@ function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
     try {
       await openKnownSession(ctx.sessions, id as SessionId, target => { ctx.uiWorkspace.openSession(target) }, request.signal)
     } catch (error) {
+      // The router owns its own Session, which the client catalog does not always list; open it directly then.
+      if (error instanceof SessionNavigationError && error.code === 'not-listed') {
+        ctx.uiWorkspace.openSession(id as SessionId)
+        return
+      }
       if (error instanceof SessionNavigationError) throw new Error(t(error.code === 'not-ready' ? 'sessionListNotReady' : 'sessionNotListed'))
       throw error
     }
   }, [ctx, t])
   const form = usePageForm(ctx.get('configForms')?.get<Record<string, unknown>>(ENTRY))
-  return <App t={t} openSession={openSession} deploymentForm={form} />
+  return <App t={t} sessions={ctx.sessions} openSession={openSession} deploymentForm={form} />
 }
 
 export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace']

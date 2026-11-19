@@ -9,6 +9,63 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [1.1.0] - 2026-11-19
+
+Merges the router panel work that was still uncommitted in the development tree, and
+makes the router preset a pure dispatcher. `engines.dsh` and the bundle entry points
+are unchanged; the changes below are additive or affect only the panel and the router
+preset.
+
+### Added
+
+- **The Router page, now the panel's home.** It shows the conversation with the main
+  Session (opened in DSH's own chat view), the worker Sessions a Ticket can borrow with
+  their status (running, borrowed, idle, unavailable), and read-only plugin discovery
+  through an index URL and a text search.
+- API routes behind it: `GET dsh-sessions`, `GET router-chat`, `GET router-events`,
+  `GET router-event-sample`, `POST router-chat`, `GET plugin-indexes`, `GET plugin-search`
+  and `POST tickets/:id/worker-session`, which binds a borrowable Session to a Ticket that
+  has not started.
+- The sidebar entry and the Router tab read `Router` instead of `Superagent` (the bundle,
+  the presets and the API paths keep their `dsh-superagent` names).
+
+### Changed
+
+- **The router preset no longer runs commands.** It lost the shell group, the sandbox and
+  the job tools; it keeps a read-only filesystem, skills, instructions, time context and
+  compaction, and dispatches through `orchestrator_*`. A shell in the router was what let
+  it work instead of routing. The worker keeps the 5-second backgrounding rule.
+- The panel opens on Router. A route remembered by 1.0.0 is deliberately not reused
+  (the storage key is now `dsh-superagent/route.v2`), so the first open after upgrading
+  lands on Router instead of a stale page.
+- A Session the client catalog does not list is now opened directly rather than reported
+  as missing: the router owns its own Session, which the catalog does not always carry.
+
+### Fixed
+
+- `LICENSE` now records the released versions (`Released as dsh-superagent 1.0.0` and
+  `1.1.0`) under the unchanged upstream copyright line.
+
+### Tests
+
+The suite is green again; nothing was skipped or deleted. Where the product contract
+changed, the assertion was re-specified to the new contract and, where coverage would
+otherwise be lost, extended:
+
+- `bundle-patch.spec.ts` — the router preset assertions now require the absence of
+  `tool-bash`, `tool-pwsh`, `bash-sandbox`, `pwsh-sandbox` and `tool-jobs` in the router
+  (and their presence in the worker), matching the new preset.
+- `client.spec.tsx` — the sidebar label is `Router`; the "Session not listed" case became
+  "opens a Session the catalog does not list directly", plus a new case for a catalog that
+  is not ready (which still reports in the interface language).
+- `navigation.spec.ts` — uses the exported `ROUTE_KEY` instead of a hardcoded key and
+  expects the new home page for an unknown saved route.
+- `panel-execution.spec.tsx`, `panel-panel.spec.tsx`, `panel-eval.spec.tsx`,
+  `panel-source.spec.tsx` — navigate to the page each test is about, since the panel now
+  opens on Router; the tab list includes Router.
+- `styles.spec.ts` — the new Router rules follow the one-rule-per-line convention of the
+  panel stylesheet.
+
 ## [1.0.0] - 2026-11-19
 
 First public release of this repository. It repackages the MIT-licensed research

@@ -38,6 +38,8 @@ it('explains what can be searched when nothing matches', async () => {
 
 it('returns to the exact page after a remount of the main panel', async () => {
   await mount()
+  // The panel opens on Router, so the open Tickets are one tab away.
+  await click(zh['tab.execution'])
   await click('修复回归')
   await remount()
   expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('修复回归')
@@ -45,7 +47,8 @@ it('returns to the exact page after a remount of the main panel', async () => {
 
 it('shows domain terms in the interface language only and lists both languages in the (?) glossary', async () => {
   await mount(en)
-  expect(all('[role="tab"]').map(tab => tab.textContent)).toEqual(['Overview', 'Source', 'Trigger', 'Eval', 'Execution', 'Settings'])
+  expect(all('[role="tab"]').map(tab => tab.textContent)).toEqual(['Overview', 'Router', 'Source', 'Trigger', 'Eval', 'Execution',
+    'Settings'])
   await click('Glossary')
   const dialog = document.querySelector('[role="dialog"]')!
   const row = [...dialog.querySelectorAll('tr')].find(item => item.textContent?.startsWith('Ticket'))!

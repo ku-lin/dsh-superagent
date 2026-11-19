@@ -12,14 +12,14 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
 type Entry = { options: { name: string; id?: string; key?: string; order?: number; locale?: string; label?: () => string }; component: ComponentType<Record<string, unknown>> }
 const t = ((key: keyof typeof zh) => zh[key] ?? key) as never
-function fixture(listed: string[]) {
+function fixture(listed: string[], phase: 'ready' | 'not-ready' = 'ready') {
   const entries: Entry[] = []
   const dictionaries: Record<string, unknown> = {}
   const ctx = {
     slots: { inject: (_name: string, register: () => void) => register(), register: (options: Entry['options'], component: Entry['component']) => { entries.push({ options, component }); return () => {} } },
     locale: { register: (ns: string, value: unknown) => { dictionaries[ns] = value; return () => {} }, bind: () => t },
     effect: (effect: () => unknown) => { effect() },
-    sessions: { list: { getSnapshot: () => ({ phase: 'ready', byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
+    sessions: { list: { getSnapshot: () => ({ phase, byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
     uiWorkspace: { openSession: vi.fn() },
     // Omit config form service so Deployment renders read-only.
     get: () => undefined,
@@ -56,7 +56,7 @@ it('registers a localized main panel, sidebar entry and Plugin Manager row page,
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
   expect(nav.options).toMatchObject({ id: 'dsh-superagent', order: 10, locale: 'dshSuperagent' })
-  expect(nav.options.label?.()).toBe('Superagent')
+  expect(nav.options.label?.()).toBe('Router')
 })
 
 it('opens a listed Session through the workspace from the main panel', async () => {
@@ -68,13 +68,24 @@ it('opens a listed Session through the workspace from the main panel', async () 
   view.dispose()
 })
 
-it('reports a Session missing from the catalog in the interface language', async () => {
+// The router owns its own Session, which the client catalog does not always list: open it directly instead of reporting it missing.
+it('opens a Session the catalog does not list directly, without reporting it missing', async () => {
   serve()
   const { ctx, main } = fixture([])
   const view = await render(main, { t })
   await openMaster(view.container)
+  expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
+  expect(document.body.textContent).not.toContain(zh.sessionNotListed)
+  view.dispose()
+})
+
+it('reports a Session list that is not ready in the interface language', async () => {
+  serve()
+  const { ctx, main } = fixture([], 'not-ready')
+  const view = await render(main, { t })
+  await openMaster(view.container)
   expect(ctx.uiWorkspace.openSession).not.toHaveBeenCalled()
-  expect(document.body.textContent).toContain(zh.sessionNotListed)
+  expect(document.body.textContent).toContain(zh.sessionListNotReady)
   view.dispose()
 })
 

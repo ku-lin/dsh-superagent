@@ -220,6 +220,8 @@ export interface Assignment {
   state: AssignmentState
   createdAt: string
   startedAt?: string
+  /** Session that actually ran this Assignment, retained when a later Assignment uses another Session. */
+  sessionId?: string
   endedAt?: string
   endedReason?: string
   report?: { state: ReportState; summary: string; at: string }
@@ -312,7 +314,10 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+export interface Execution { name: string; directory: string; assignment: string
+  /** Opt-in loan of an existing DSH conversation; absent means the owned worker-<ticketId> Session. */
+  borrowedSession?: { sessionId: string; boundAt: string }
+}
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

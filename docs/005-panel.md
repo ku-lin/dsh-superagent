@@ -12,11 +12,12 @@ Opening the panel answers three questions, in this order:
 
 ## Tabs
 
-The tabs follow the workflow: **Overview**, **Source**, **Trigger**, **Eval**, **Execution**, and **Settings**. Until repository and account setup succeeds, Overview shows what is missing and links to the relevant setting.
+The tabs follow the workflow: **Overview**, **Router**, **Source**, **Trigger**, **Eval**, **Execution**, and **Settings**. Until repository and account setup succeeds, Overview shows what is missing and links to the relevant setting.
 
 | Tab | Shows |
 | --- | --- |
 | Overview | Tickets needing action, system problems, activity counts for the last 24 hours, and Executor load. Each block links to its detailed page |
+| Router | A pending Ticket, the DSH conversations it may borrow, and read-only plugin discovery. A conversation is listed only when it is idle, not listed yet as another Ticket's worker, and available; binding it needs an explicit choice and a confirmation, and it keeps its own prompt and tools while it holds the Ticket's tools. Discovery lists the indexes the host reports and searches the selected one; it never installs a plugin |
 | Source | Source state, setup problems and non-zero counts. Filtered Triggers and dropped messages cover the same 24-hour window as Overview |
 | Trigger | Threads filtered by Subscribed, Evaluating, New Triggers in 24 h, or All Threads. Each Thread shows its Triggers newest first, Decisions and Subscriptions |
 | Eval | Decisions with their reason and matched rules |

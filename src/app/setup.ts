@@ -41,8 +41,19 @@ export class Setup {
     return this.resolved
   }
   configured(): boolean { return this.resolved !== undefined }
+  /**
+   * True when no Source is enabled: nothing can open a Ticket, but the Router conversation and worker control still work,
+   * so the plugin starts instead of demanding a GitHub repository.
+   */
+  sourceless = false
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
+    const enabled = (source: string) => settings.sources[source]?.enabled !== false && !!settings.sources[source]
+    if (!enabled('github') && !enabled('feishu')) {
+      // No Source at all: start with the Router available and no dispatch environment to prepare.
+      this.sourceless = true; this.problem = undefined; return true
+    }
+    this.sourceless = false
     try { this.resolved = await this.resolve(settings); return true }
     catch (error) {
       if (!(error instanceof SetupError)) throw error

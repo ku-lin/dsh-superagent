@@ -10,7 +10,9 @@ import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+/** POSIX (`/x`), drive (`C:\x`, `C:/x`) or UNC (`\\server\share`) form: `path.isAbsolute` for the platforms this runs on. */
+const ABSOLUTE = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/
+const absolute = (description: string) => s.string().pattern(ABSOLUTE).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
