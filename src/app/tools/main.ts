@@ -339,7 +339,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_worker_list',
-      description: 'List the DSH conversations this Router may command, each with its title and whether it is running, available, or already working for a ticket. Reads them; nothing is delivered. Name a conversation by its title when reporting to the person.',
+      description: 'List the DSH conversations this Router may command, with each title and whether it is running, available, or working a ticket. Reads only; nothing is delivered. Name a conversation by its title when reporting.',
       schema: z.object({}).strict(),
       execute: async () => {
         const listed = await host.context.sessionController.list({}, new AbortController().signal)
@@ -363,7 +363,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_worker_message',
-      description: 'Send one message to an existing DSH conversation and return the answer it gives. This is how the Router works: it routes, it does not do the work itself. Address the conversation by `title` (as orchestrator_worker_list reports it) or, when a title is blank or two share one, by `session`. Deliveries need no executor directory or prepare command; those configure the ticket worktrees of a different path.',
+      description: 'Send one message to an existing DSH conversation and return its answer. This is how the Router works: it routes; it does not do the work. Address it by `title` (as orchestrator_worker_list reports it) or, for a blank or shared title, by `session`. Deliveries need no executor directory or prepare command; those configure ticket worktrees.',
       schema: z.object({
         title: z.string().trim().min(1).optional().describe('The conversation\'s title, as orchestrator_worker_list reports it. Preferred over session.'),
         session: z.string().min(1).optional().describe('The conversation\'s session id, for a blank or ambiguous title.'),
