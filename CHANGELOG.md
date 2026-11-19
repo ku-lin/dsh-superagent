@@ -18,14 +18,20 @@ documentation.
 ### Added
 
 - Standalone packaging: `private` removed, `repository`/`bugs`/`homepage`/`keywords`/
-  `publishConfig` added, `files` extended with `examples` and `CHANGELOG.md`, and a
-  `prepublishOnly` build hook so `npm publish` never ships a stale `lib/`.
+  `publishConfig` added, `files` extended with `docs`, `SETUP.md`, `examples` and
+  `CHANGELOG.md`, and a `prepublishOnly` build hook so `npm publish` never ships a
+  stale `lib/`.
 - `README.md` restructured: install steps, minimal example, configuration reference,
   permissions and security notes, compatibility table and known limitations.
-- `CONTRIBUTING.md`, this changelog, and a wider `.gitignore` (state directory,
+- `CONTRIBUTING.md`, this changelog, `.gitattributes` (LF for every text file, so the
+  python3 script keeps its shebang) and a wider `.gitignore` (state directory,
   sqlite/WAL, local secrets and editor noise).
 - GitHub Actions CI: typecheck, unit tests and `npm pack --dry-run` on Node 22.19
   and 24. It uses the public npm registry only and needs no secrets.
+- CI retries the suite once. `tests/sources.spec.ts` ("feishu event consumer") has a
+  stream-interleaving race: a malformed line reports an error on stdout while
+  `[event] ready` arrives on stderr, and whichever is processed last wins the reported
+  health. Product behavior is unchanged; the test is inherently timing-sensitive.
 
 ### Notes
 

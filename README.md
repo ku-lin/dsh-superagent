@@ -136,6 +136,7 @@ Honest list — several of these are the difference between "runs" and "supporte
 - **One repository per installation.** The GitHub Source takes a single `owner/name`.
 - **End-to-end flows are not covered by the test suite.** The tests exercise units and the panel against fixtures; the GitHub and Feishu round-trips need real accounts, a real bot and a real repository, and are not verified in CI.
 - **CI cannot validate DSH runtime behavior.** It typechecks, runs unit tests and checks the package contents; DSH itself is not booted in CI.
+- **One test is timing-sensitive.** `tests/sources.spec.ts` ("feishu event consumer") races a malformed-line error on stdout against an `[event] ready` line on stderr, and whichever is processed last wins the reported health. CI retries the suite once instead of changing the behavior; expect an occasional flake when running `pnpm test` locally.
 - **`pnpm build` is required before `npm pack`/`npm publish`.** `lib/` is a build output and is not committed.
 - **English and Chinese UI only** (`locale/en.json`, `locale/zh.json`).
 
@@ -171,8 +172,8 @@ This repository repackages, for publication as a standalone plugin repository, t
 
 Changes made here, relative to that upstream snapshot:
 
-- Packaging metadata for standalone publication: `private` removed; `repository`, `bugs`, `homepage`, `keywords` and `publishConfig` added; `files` extended with `examples` and `CHANGELOG.md`; a `prepublishOnly` build hook.
-- Added `CHANGELOG.md`, `CONTRIBUTING.md`, a GitHub Actions workflow (typecheck + test + `npm pack --dry-run`), and a wider `.gitignore`.
+- Packaging metadata for standalone publication: `private` removed; `repository`, `bugs`, `homepage`, `keywords` and `publishConfig` added; `files` extended with `docs`, `SETUP.md`, `examples` and `CHANGELOG.md`; a `prepublishOnly` build hook.
+- Added `CHANGELOG.md`, `CONTRIBUTING.md`, `.gitattributes` (LF for every text file), a GitHub Actions workflow (typecheck + test + `npm pack --dry-run`), and a wider `.gitignore`.
 - This README was restructured to state install steps, configuration, permissions and limitations explicitly; the code itself was not modified.
 
 Future fixes belong upstream if they are general, and here if they are about packaging.
