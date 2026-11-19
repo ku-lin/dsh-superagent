@@ -1,5 +1,7 @@
 # dsh-superagent
 
+**Version 1.0.0** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
+
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
 > We have adapted it for publication, so it is not identical to our internal version or the implementation described in *Exploring Super-agent Design: Towards a More Autonomous Agent System*. Some designs discussed in the article are directions for future development and are not implemented in this prototype.
@@ -136,7 +138,7 @@ Honest list — several of these are the difference between "runs" and "supporte
 - **One repository per installation.** The GitHub Source takes a single `owner/name`.
 - **End-to-end flows are not covered by the test suite.** The tests exercise units and the panel against fixtures; the GitHub and Feishu round-trips need real accounts, a real bot and a real repository, and are not verified in CI.
 - **CI cannot validate DSH runtime behavior.** It typechecks, runs unit tests and checks the package contents; DSH itself is not booted in CI.
-- **One test is timing-sensitive.** `tests/sources.spec.ts` ("feishu event consumer") races a malformed-line error on stdout against an `[event] ready` line on stderr, and whichever is processed last wins the reported health. CI retries the suite once instead of changing the behavior; expect an occasional flake when running `pnpm test` locally.
+- **The suite has poll-based tests.** Several source tests wait on real subprocesses with `waitFor` timeouts, so CI retries the suite once as insurance on a loaded runner.
 - **`pnpm build` is required before `npm pack`/`npm publish`.** `lib/` is a build output and is not committed.
 - **English and Chinese UI only** (`locale/en.json`, `locale/zh.json`).
 

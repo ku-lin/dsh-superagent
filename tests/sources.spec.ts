@@ -1089,12 +1089,18 @@ describe('feishu event consumer', () => {
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
-    const { ctx, health, store } = consumerSource(cli('events'))
+    const { ctx, store } = consumerSource(cli('events'))
+    // A malformed line reports an error from stdout, while "[event] ready" arrives on stderr; the two streams are
+    // not ordered against each other, so the surviving health entry is whichever was processed last. Record every
+    // report and assert the error was reported, instead of reading the last one.
+    const reported: { state: string; detail?: unknown }[] = []
+    const report = ctx.report
+    Object.defineProperty(ctx, 'report', { value: (entry: string, value: Parameters<typeof report>[1]) => { reported.push(value); report(entry, value) } })
     running = runFeishu(ctx, controller.signal)
     await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
     expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
     expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    expect(reported.some(entry => entry.state === 'error' && String(entry.detail).includes('JSON'))).toBe(true)
     controller.abort(); await running; store.close()
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {

@@ -5,15 +5,15 @@ All notable changes to this repository are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Because this package ships inside DeepSeek Harness, the `engines.dsh` range is part
-of the compatibility surface: a change that raises it is a breaking change, even
-while the version stays in `0.x`.
+of the compatibility surface: a change that raises it is a breaking change. The
+`1.x` line is the first published line; the upstream prototype it is based on called
+itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
-## [0.1.0] - 2026-11-19
+## [1.0.0] - 2026-11-19
 
 First public release of this repository. It repackages the MIT-licensed research
 prototype from [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)
-as a standalone plugin repository; the code is unchanged apart from packaging and
-documentation.
+(upstream commit `8c32a9d`) as a standalone plugin repository.
 
 ### Added
 
@@ -24,18 +24,29 @@ documentation.
 - `README.md` restructured: install steps, minimal example, configuration reference,
   permissions and security notes, compatibility table and known limitations.
 - `CONTRIBUTING.md`, this changelog, `.gitattributes` (LF for every text file, so the
-  python3 script keeps its shebang) and a wider `.gitignore` (state directory,
-  sqlite/WAL, local secrets and editor noise).
-- GitHub Actions CI: typecheck, unit tests and `npm pack --dry-run` on Node 22.19
-  and 24. It uses the public npm registry only and needs no secrets.
-- CI retries the suite once. `tests/sources.spec.ts` ("feishu event consumer") has a
-  stream-interleaving race: a malformed line reports an error on stdout while
-  `[event] ready` arrives on stderr, and whichever is processed last wins the reported
-  health. Product behavior is unchanged; the test is inherently timing-sensitive.
+  python3 `scripts/dsh-superagent` keeps a working shebang — the file also keeps its
+  executable bit) and a wider `.gitignore` (state directory, sqlite/WAL, local
+  secrets and editor noise).
+- GitHub Actions CI: typecheck, unit tests and `npm pack --dry-run` on Node 22.19 and
+  24, with one retry as insurance for the suite's poll/`waitFor` tests. It uses the
+  public npm registry only and needs no secrets.
+
+### Fixed
+
+- `tests/sources.spec.ts` ("feishu event consumer: … reports a malformed line without
+  stopping") asserted that the *last* health entry was the JSON error, but the error
+  arrives on stdout while `[event] ready` arrives on stderr, and the two streams are
+  not ordered against each other — on Linux the ready line is processed last, so the
+  assertion failed on every run. The test now records every `ctx.report` and asserts
+  the error was reported, which keeps its intent and drops the ordering assumption.
+  Product behavior is unchanged.
 
 ### Notes
 
 - The bundle entry points, agent presets (`dsh-superagent-router`,
   `dsh-superagent-worker`) and the `/orchestrator/api/` surface are unchanged, so an
   existing profile configured against the upstream prototype keeps working.
-- Not published to npm; install from source with `pnpm install && pnpm build`.
+- Not published to npm; install from source with `pnpm install && pnpm build`. The
+  name `dsh-superagent` is free on the registry, so a later release can claim it.
+- `1.0.0` states "this is the released packaging", not "production ready": see the
+  disclaimer and known limitations in `README.md`.
