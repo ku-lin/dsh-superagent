@@ -7,11 +7,12 @@ import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { ABSOLUTE_PATH } from './infra/paths.ts'
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-/** POSIX (`/x`), drive (`C:\x`, `C:/x`) or UNC (`\\server\share`) form: `path.isAbsolute` for the platforms this runs on. */
-const ABSOLUTE = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/
+/** POSIX (`/x`), drive (`C:\x`, `C:/x`) or UNC (`\\server\share`) form; shared with the settings schema. */
+const ABSOLUTE = ABSOLUTE_PATH
 const absolute = (description: string) => s.string().pattern(ABSOLUTE).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({

@@ -14,18 +14,18 @@ It is also a way of working with an agent: **take as little human attention as p
 
 A single chat session does not scale to a team: requests arrive from several places, everyone expects an answer in the thread they asked in, and one long-running agent either blocks on a single task or works on things nobody asked for. `dsh-superagent` splits that into three stored decisions:
 
-1. **Where requests come from** â€?a *Source* (GitHub notifications and mentions, or Feishu chats) turns messages into *Triggers*.
-2. **Who may ask** â€?a *Policy* decides whether a Trigger becomes a *Ticket*. Until an allowed list has someone on it, nothing becomes work.
-3. **What happens next** â€?each Ticket runs in its **own DSH Session and directory**, and the result is delivered back to the conversation it came from.
+1. **Where requests come from** â€” a *Source* (GitHub notifications and mentions, or Feishu chats) turns messages into *Triggers*.
+2. **Who may ask** â€” a *Policy* decides whether a Trigger becomes a *Ticket*. Until an allowed list has someone on it, nothing becomes work.
+3. **What happens next** â€” each Ticket runs in its **own DSH Session and directory**, and the result is delivered back to the conversation it came from.
 
 ## How it works (router / orchestrator)
 
 The bundle defines two DSH agent presets, and they are the router/worker split:
 
-- **`dsh-superagent-router`** â€?the main Session, reduced to routing: no shell, no sandbox and no job tools, a **read-only** filesystem (`write` and `edit` off), skills and compaction. It routes; it does not run commands. Also absent: subagents, file search, web, todo list, questions to a person, presenting, plan mode, plugin manager, scheduling, goals and workflows.
-- **`dsh-superagent-worker`** â€?an Executor Session. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, spawned subagents, web search without fetch.
+- **`dsh-superagent-router`** â€” the main Session, reduced to routing: no shell, no sandbox and no job tools, a **read-only** filesystem (`write` and `edit` off), skills and compaction. It routes; it does not run commands. Also absent: subagents, file search, web, todo list, questions to a person, presenting, plan mode, plugin manager, scheduling, goals and workflows.
+- **`dsh-superagent-worker`** â€” an Executor Session. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, spawned subagents, web search without fetch.
 
-A foreground command or job wait in a worker longer than **5 seconds** moves to a background job, so a long command does not hold back the next candidate. Neither preset can be hidden from the preset picker â€?DSH has no setting for that â€?so their names and descriptions say whom they are for. **Do not select them for personal Sessions.** See [cordis.patch.yml](cordis.patch.yml), [docs/003-execution.md](docs/003-execution.md) and [docs/007-architecture.md](docs/007-architecture.md).
+A foreground command or job wait in a worker longer than **5 seconds** moves to a background job, so a long command does not hold back the next candidate. Neither preset can be hidden from the preset picker â€” DSH has no setting for that â€” so their names and descriptions say whom they are for. **Do not select them for personal Sessions.** See [cordis.patch.yml](cordis.patch.yml), [docs/003-execution.md](docs/003-execution.md) and [docs/007-architecture.md](docs/007-architecture.md).
 
 The panel opens on **Router**: the conversation with the main Session, the worker Sessions a Ticket can borrow, and read-only plugin discovery. The other tabs are the work views. The panel and the host share a local HTTP API under `/orchestrator/api/`, documented in [docs/006-deployment.md](docs/006-deployment.md#management-api).
 
@@ -33,7 +33,7 @@ The panel opens on **Router**: the conversation with the main Session, the worke
 
 - **Node.js** `^22.19.0 || >=24.0.0` (see `engines.node`)
 - **pnpm** (the `packageManager` field pins the version; corepack honors it)
-- **DeepSeek Harness** within the `engines.dsh` range â€?currently `^0.2.1-alpha.2`. Because these are prerelease versions, DSH's own compatibility gate is strict: only DSH `0.2.1-*` prereleases are accepted.
+- **DeepSeek Harness** within the `engines.dsh` range â€” currently `^0.2.1-alpha.2`. Because these are prerelease versions, DSH's own compatibility gate is strict: only DSH `0.2.1-*` prereleases are accepted.
 - **git** 2.32+, **Python** 3.8+, **tmux**, and **GitHub CLI** 2.48+ (`gh`) on the host that runs the service
 - A model provider configured in the DSH profile the service runs in
 - A repository on **github.com** (GitHub Enterprise Server is not supported)
@@ -63,7 +63,7 @@ scripts/dsh-superagent start
 
 Keep this profile separate from the one you work in: the plugin changes process-wide `PATH` and git configuration, and its process needs independent restarts and upgrades.
 
-**Setup is interactive by design.** The full path â€?accounts, agent GitHub CLI wrappers, Feishu bot, settings, verification â€?has many steps, so an agent walks through it with you. Ask your coding agent:
+**Setup is interactive by design.** The full path â€” accounts, agent GitHub CLI wrappers, Feishu bot, settings, verification â€” has many steps, so an agent walks through it with you. Ask your coding agent:
 
 > Read SETUP.md in this repository and set up dsh-superagent with me.
 
@@ -73,7 +73,7 @@ After setup reports no outstanding requirement (`scripts/dsh-superagent status` 
 
 1. Open an Issue, or post a comment, containing `@<agent login> <request>`.
 2. Within one polling interval (a minute by default), the panel's **Overview** shows a Ticket.
-3. The agent acknowledges in the thread, works in its own Session and directory, and delivers there â€?for example as a pull request.
+3. The agent acknowledges in the thread, works in its own Session and directory, and delivers there â€” for example as a pull request.
 
 On GitHub, a mention added by *editing* an existing Issue body is not received; post a new comment instead.
 
@@ -81,7 +81,7 @@ On GitHub, a mention added by *editing* an existing Issue body is not received; 
 
 Two layers, and they are deliberately separate.
 
-**Machine configuration** â€?`~/.dsh/profiles/<profile>/cordis.patch.yml`, copied from [examples/profile.cordis.patch.yml](examples/profile.cordis.patch.yml). This needs a restart to change.
+**Machine configuration** â€” `~/.dsh/profiles/<profile>/cordis.patch.yml`, copied from [examples/profile.cordis.patch.yml](examples/profile.cordis.patch.yml). This needs a restart to change.
 
 | Key | Required | Meaning |
 | --- | --- | --- |
@@ -90,9 +90,9 @@ Two layers, and they are deliberately separate.
 | `admissionContextMaxPages` | no | How many Thread pages one assessment reads. |
 | `admissionContextTimeoutMs` | no | How long that assessment may take. |
 
-`stateDir` accepts any absolute form the host recognizes (`/srv/dsh-superagent`, `C:\dsh\superagent`, `C:/dsh/superagent`, `\\server\share\superagent`); a relative path or `~/dir` is refused at startup. After the first start, the machine limits are editable in **Settings â†?Deployment**; `stateDir` is not.
+`stateDir` accepts any absolute form the host recognizes (`/srv/dsh-superagent`, `C:\dsh\superagent`, `C:/dsh/superagent`, `\\server\share\superagent`); a relative path or `~/dir` is refused at startup. After the first start, the machine limits are editable in **Settings â†’ Deployment**; `stateDir` is not.
 
-**Application settings** â€?edited in the panel, or through the local API (`PUT settings/<block>`). No restart for most of them.
+**Application settings** â€” edited in the panel, or through the local API (`PUT settings/<block>`). No restart for most of them.
 
 | Block | Holds |
 | --- | --- |
@@ -112,24 +112,24 @@ Read this before you run it on a machine you care about.
 - **No isolation from the operator.** Both presets run with `danger-full-access` as the operator's OS user, read messages from subscribed Threads, and a worker can execute programs by path and read the operator's home directory. Account wrappers choose the agent's credentials; they do **not** sandbox the process. If you need isolation, use a dedicated OS account that contains only the agent's credentials. ([docs/006-deployment.md](docs/006-deployment.md))
 - **A dedicated GitHub account is required, not recommended.** The agent comments, pushes and opens pull requests as that account. A GitHub App cannot be the agent, because the agent reads the account's notifications. Point it at a CLI wrapper that uses only that account's credentials.
 - **Credential handling.** Setup writes command shims into `<stateDir>/worker-bin` (first on `PATH`) and a git configuration into `<stateDir>/worker-gitconfig` that replaces the operator's global and system git configuration. It removes environment variables whose names contain `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, removes `GH_TOKEN`/`GITHUB_TOKEN`, and configures git never to prompt. A file in either directory that `dsh-superagent` did not write stops setup.
-- **Local HTTP only.** The API binds to loopback (`127.0.0.1`/`localhost`) and requires the `x-orchestrator-request: 1` header; a request with a foreign `Origin` gets 403. It is not authenticated beyond that â€?treat any local process as able to drive it.
+- **Local HTTP only.** The API binds to loopback (`127.0.0.1`/`localhost`) and requires the `x-orchestrator-request: 1` header; a request with a foreign `Origin` gets 403. It is not authenticated beyond that â€” treat any local process as able to drive it.
 - **What the agent can be talked into.** The Policy is the only barrier between a chat message and a Session that can run commands. Start with a short allowed list.
 
 ## Compatibility
 
 | | |
 | --- | --- |
-| DeepSeek Harness | `engines.dsh: ^0.2.1-alpha.2` â€?the published code is exercised against **DSH 0.2.1-rc.2** |
+| DeepSeek Harness | `engines.dsh: ^0.2.1-alpha.2` â€” the published code is exercised against **DSH 0.2.1-rc.2** |
 | Node.js | `^22.19.0 \|\| >=24.0.0`; CI covers 22.19 and 24 |
 | GitHub | github.com only; GitHub Enterprise Server is not supported |
 | Feishu | optional; `lark-cli` 1.0.90 per the deployment guide |
-| OS of the service host | **POSIX** for `scripts/dsh-superagent` (it uses `fcntl`, `ps` and tmux) â€?see limitations |
+| OS of the service host | **POSIX** for `scripts/dsh-superagent` (it uses `fcntl`, `ps` and tmux) â€” see limitations |
 
 Because `engines.dsh` names a prerelease, DSH's compatibility gate rejects newer minor lines. A database migrated by a newer version cannot be opened by an older one: back up `<stateDir>/orchestrator.sqlite` before upgrading.
 
 ## Known limitations
 
-Honest list â€?several of these are the difference between "runs" and "supported".
+Honest list â€” several of these are the difference between "runs" and "supported".
 
 - **Research prototype.** Not production-ready, not an official DeepSeek product, and reviewed by nobody outside its authors. Expect bugs.
 - **`scripts/dsh-superagent` is POSIX-only.** It imports `fcntl` and shells out to `ps`/`tmux`. On Windows use it under WSL, or start the profile yourself and skip the script's log and control handling.
@@ -152,9 +152,9 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [003 Execution](docs/003-execution.md)
 - [004 Prompts](docs/004-prompts.md)
 - [005 Panel](docs/005-panel.md)
-- [006 Deployment](docs/006-deployment.md) â€?manual setup, configuration, upgrades, troubleshooting
+- [006 Deployment](docs/006-deployment.md) â€” manual setup, configuration, upgrades, troubleshooting
 - [007 Architecture](docs/007-architecture.md)
-- [008 Cookbook](docs/008-cookbook.md) â€?adding a Source
+- [008 Cookbook](docs/008-cookbook.md) â€” adding a Source
 
 ## Development
 
