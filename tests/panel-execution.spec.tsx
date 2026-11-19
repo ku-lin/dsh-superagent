@@ -42,6 +42,8 @@ it('lists Tickets under Execution by who they wait on, with the Executor state a
 
 it('stops an open Ticket from its page after confirmation', async () => {
   await mount()
+  // The panel opens on Router, so the open Tickets are one tab away.
+  await click(zh['tab.execution'])
   await click('修复回归')
   await click(zh.stop)
   expect(server.requests.some(request => request.path.endsWith('/stop'))).toBe(false)
@@ -52,6 +54,8 @@ it('stops an open Ticket from its page after confirmation', async () => {
 
 it('shows a Ticket with its stage, its Mandate details with the Trigger and Decision behind it, its Threads, and the rest behind disclosures', async () => {
   await mount()
+  // The panel opens on Router, so the open Tickets are one tab away.
+  await click(zh['tab.execution'])
   await click(all('.dt-open').find(button => button.textContent === '修复回归')!)
   expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('修复回归')
   // Progress is in the Channels and the Session, so the page has no report section.
@@ -90,6 +94,8 @@ it('links a question to its Channel, folds consecutive automated messages among 
   server.ticketDetails.t1 = { ...t1, stage: 'person', action: 'answer', attention: { id: 'q1', question: '需要确认按钮颜色' }, inputs: [ci('i3',
     '2026-09-22T00:06:00Z', 1), ci('i2', '2026-09-22T00:05:00Z', 0)] }
   await mount()
+  // The panel opens on Router, so the open Tickets are one tab away.
+  await click(zh['tab.execution'])
   await click(all('.dt-open').find(button => button.textContent === '修复回归')!)
   expect(all('.dt-banner a').map(link => [link.textContent, link.getAttribute('href')])).toEqual([['去飞书回答',
     'https://applink.feishu.cn/client/chat/open?openChatId=oc_1']])

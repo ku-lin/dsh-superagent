@@ -50,6 +50,11 @@ describe('configuration schema', () => {
     expect(() => Config(minimal({ stateDir: 'relative/dir' }))).toThrow()
     expect(() => Config(minimal({ stateDir: '~/dir' }))).toThrow()
   })
+  it('accepts an absolute state directory in POSIX, drive and UNC forms', () => {
+    for (const stateDir of ['/srv/dsh-superagent', 'C:\\dsh\\superagent', 'C:/dsh/superagent', '\\\\server\\share\\superagent']) {
+      expect(machineOf(Config({ stateDir })).stateDir).toBe(stateDir)
+    }
+  })
   it('names keys the configuration does not define, and where the values of older keys live now', () => {
     const raw = minimal({ repository: 'acme/widgets', repositoryPath: '/srv/widgets', blockedCommands: [], author: { name: 'Alice' }, extra: 1 })
     expect(() => machineOf(Config(raw))).toThrow('keys it does not use: repository (now on the GitHub Source), repositoryPath (now in the prepare command of the Execution settings), blockedCommands (now in the Execution settings), author (now prompt text), extra;')

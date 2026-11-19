@@ -67,6 +67,56 @@ it('decodes path parameters and parses each route\'s query', async () => {
   expect(seen).toEqual(['feishu:oc_1:om/root', { filter: { kinds: ['accept', 'reopen'], since: expect.any(String) }, offset: 0, limit: 200 }])
 })
 
+it('lists visible DSH sessions and binds one unstarted ticket with an exclusive idempotent loan', async () => {
+  const first = { id: 't1', status: 'open', assignments: [{ id: 'a1', state: 'pending' }],
+    execution: { name: 'one', directory: 'test', assignment: 'work' } }
+  const second = { ...first, id: 't2', assignments: [{ id: 'a2', state: 'pending' }],
+    execution: { ...first.execution } }
+  const tickets = [first, second]
+  const sessions = [{ sessionId: 'human-1', agentAvailable: true, updatedAt: 1, running: false, blank: false },
+    { sessionId: 'worker-t1', agentAvailable: true, updatedAt: 1, running: false, blank: false }]
+  const call = serve({
+    masterId: 'orchestrator-id',
+    listDshSessions: async () => sessions,
+    executor: { bindingInProgress: () => false },
+    store: { atomic: (work: () => unknown) => work(), tickets: {
+      get: (id: string) => tickets.find(item => item.id === id), open: () => tickets, list: () => tickets,
+      save: (item: typeof first) => { const index = tickets.findIndex(ticket => ticket.id === item.id); tickets[index] = item },
+    } },
+  })
+  expect(await call('GET', 'dsh-sessions')).toMatchObject({ status: 200, body: { items: [
+    { sessionId: 'human-1', borrowable: true }, { sessionId: 'worker-t1', borrowable: false }] } })
+  expect(await call('POST', 'tickets/t1/worker-session', { sessionId: 'worker-t1' })).toMatchObject({ status: 404 })
+  const bound = await call('POST', 'tickets/t1/worker-session', { sessionId: 'human-1' })
+  expect(bound).toMatchObject({ status: 200, body: { ticketId: 't1', sessionId: 'human-1', unchanged: false } })
+  expect(await call('GET', 'dsh-sessions')).toMatchObject({ body: { items: [{ leasedToTicketId: 't1', borrowable: false },
+    { sessionId: 'worker-t1', borrowable: false }] } })
+  expect(await call('POST', 'tickets/t1/worker-session', { sessionId: 'human-1' })).toMatchObject({ status: 200,
+    body: { boundAt: bound.body.boundAt, unchanged: true } })
+  expect(await call('POST', 'tickets/t2/worker-session', { sessionId: 'human-1' })).toMatchObject({ status: 409 })
+  expect(await call('POST', 'tickets/t1/worker-session', { sessionId: 'other' })).toMatchObject({ status: 404 })
+  tickets[1]!.assignments = [{ id: 'old', state: 'ended', startedAt: '2026-11-01T00:00:00Z' }, { id: 'a2', state: 'pending' }] as typeof tickets[1]['assignments']
+  expect(await call('POST', 'tickets/t2/worker-session', { sessionId: 'worker-t1' })).toMatchObject({ status: 404 })
+  sessions.push({ sessionId: 'human-2', agentAvailable: true, updatedAt: 1, running: false, blank: false })
+  expect(await call('POST', 'tickets/t2/worker-session', { sessionId: 'human-2' })).toMatchObject({ status: 409 })
+})
+
+it('discovers only configured plugin indexes without installing anything', async () => {
+  const queries: unknown[] = []
+  const call = serve({ pluginMarket: { listIndexes: () => [{ url: 'https://market.example/index.json', title: 'Fixture market' }],
+    search: async (...args: unknown[]) => { queries.push(args); return { entries: [{ name: 'fixture.plugin', title: 'Fixture',
+      description: 'Read only', defaultVersion: '1.2.3', installation: { status: 'not-installed' } }], total: 1, nextOffset: null } } } })
+  expect(await call('GET', 'plugin-indexes')).toMatchObject({ status: 200, body: { available: true,
+    items: [{ url: 'https://market.example/index.json' }] } })
+  expect(await call('GET', 'plugin-search?url=https%3A%2F%2Fevil.example%2Fplugins&text=x')).toMatchObject({ status: 400 })
+  expect(queries).toEqual([])
+  expect(await call('GET', 'plugin-search?url=https%3A%2F%2Fmarket.example%2Findex.json&text=hello')).toMatchObject({ status: 200,
+    body: { entries: [{ name: 'fixture.plugin', version: '1.2.3', installation: 'not-installed' }], total: 1 } })
+  expect(queries).toEqual([['https://market.example/index.json',
+    { text: 'hello', sort: { kind: 'relevance' }, offset: 0, limit: 30 }]])
+  expect(await serve({})('GET', 'plugin-indexes')).toEqual({ status: 200, body: { available: false, items: [] } })
+})
+
 it('answers only a same-origin request from the panel on the loopback address', async () => {
   const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)

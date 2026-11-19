@@ -18,3 +18,10 @@ export function packageRoot(): string {
   throw new Error('dsh-superagent package root not found')
 }
 export const packagePath = (...parts: string[]): string => join(packageRoot(), ...parts)
+
+/**
+ * A path a person types into a setting: POSIX (`/x`), drive (`C:\x`, `C:/x`) or UNC (`\\server\share`).
+ * Deliberately platform-independent — a settings file written on Windows stays valid on Linux and the other way
+ * round — so it does not use `path.isAbsolute`, which answers for the running platform only.
+ */
+export const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/

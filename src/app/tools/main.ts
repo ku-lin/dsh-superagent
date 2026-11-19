@@ -22,7 +22,7 @@ export interface MainToolsHost {
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -31,6 +31,8 @@ export interface MainToolsHost {
   sendReplies(): Promise<void>
   /** Runs an Engine command initiated by the main Session without emitting self-notifications. */
   quietly<T>(run: () => T): T
+  /** A Session's committed title, read from its history when the host list does not project one. */
+  titleOf(sessionId: string): Promise<string>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
 function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: string; ticketId?: string | undefined }) {
@@ -151,7 +153,45 @@ function routeTool(host: MainToolsHost): Tool {
     },
   })
 }
+/** Resolves a delivery target by title (preferred), or by session id when the title is blank or shared. */
+async function resolveWorker(host: MainToolsHost, agent: Agent, title: string | undefined, session: string | undefined):
+  Promise<{ sessionId: string; title: string } | { error: string }> {
+  if (!title && !session) return { error: 'Name the conversation: give its title, or its session id when no title is shown' }
+  const listed = await host.context.sessionController.list({}, new AbortController().signal)
+  const rows: { sessionId: string; title: string }[] = []
+  for (const item of listed.items) {
+    if (item.sessionId === agent.id) continue
+    const titled = item as typeof item & { title?: string; projectionValues?: { title?: string } }
+    let shown = titled.title ?? titled.projectionValues?.title ?? ''
+    if (!shown) shown = await host.titleOf(item.sessionId).catch(() => '')
+    rows.push({ sessionId: item.sessionId, title: shown })
+  }
+  if (session) {
+    if (session === agent.id) return { error: 'The Router conversation cannot message itself' }
+    const row = rows.find(item => item.sessionId === session)
+    if (!row) return { error: `Unknown conversation: ${session}` }
+    return row
+  }
+  const matches = rows.filter(item => item.title === title)
+  if (matches.length === 1) return matches[0]!
+  if (matches.length > 1) return { error: `${matches.length} conversations are titled "${title}"; name one by session id` }
+  const partial = rows.filter(item => item.title && item.title.includes(title!))
+  if (partial.length === 1) return partial[0]!
+  return { error: `No conversation is titled "${title}"${partial.length ? `; did you mean ${partial.map(item => item.title).join(', ')}?` : ''}` }
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
+/** The answer a conversation produced after `from`, as its last assistant text; empty when it has not answered yet. */
+function answerAfter(agent: Agent, from: number): string {
+  const last = agent.session.snapshotEvents().slice(from).filter(event => event.type === 'assistant/message').at(-1)
+  return last?.type === 'assistant/message'
+    ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : ''
+}
+/** Resolves when the conversation's turn ends, or false on timeout or when the caller is cancelled. */
+async function untilIdle(agent: Agent, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
+  const wait = (ms: number) => new Promise<boolean>(resolve => { setTimeout(() => resolve(false), ms) })
+  const cancelled = new Promise<boolean>(resolve => { signal.addEventListener('abort', () => resolve(false), { once: true }) })
+  return await Promise.race([agent.whenIdle().then(() => true), wait(timeoutMs), cancelled])
+}
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
   return [
@@ -295,6 +335,55 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         if (args.baseRevision === undefined) throw new Error('Saving needs baseRevision, the revision the configuration edits')
         const { context_delivery: _delivery, ...saved } = await savePrompts(host, args.config, args.baseRevision, 'tool')
         return saved
+      },
+    }),
+    tool({
+      name: 'orchestrator_worker_list',
+      description: 'List the DSH conversations this Router may command, with each title and whether it is running, available, or working a ticket. Reads only; nothing is delivered. Name a conversation by its title when reporting.',
+      schema: z.object({}).strict(),
+      execute: async () => {
+        const listed = await host.context.sessionController.list({}, new AbortController().signal)
+        const tickets = host.store.tickets.open()
+        const claimed = new Map(tickets.flatMap(ticket => ticket.execution?.borrowedSession
+          ? [[ticket.execution.borrowedSession.sessionId, ticket] as const] : []))
+        const items: { title: string; running: boolean; available: boolean; ticket?: string; session: string }[] = []
+        for (const item of listed.items) {
+          if (item.sessionId === agent.id) continue
+          // Answer with the conversation's title, never its id: a person reading this chat should not have to parse ids.
+          // The host list may omit it, so the Session's own history supplies the title it committed.
+          const titled = item as typeof item & { title?: string; projectionValues?: { title?: string } }
+          let title = titled.title ?? titled.projectionValues?.title ?? ''
+          if (!title) title = await host.titleOf(item.sessionId).catch(() => '')
+          const ticket = claimed.get(item.sessionId)
+          items.push({ title, running: item.running, available: item.agentAvailable,
+            ...(ticket ? { ticket: ticket.title } : {}), session: item.sessionId })
+        }
+        return { items }
+      },
+    }),
+    tool({
+      name: 'orchestrator_worker_message',
+      description: 'Send one message to an existing DSH conversation and return its answer. This is how the Router works: it routes; it does not do the work. Address it by `title` (as orchestrator_worker_list reports it) or, for a blank or shared title, by `session`. Deliveries need no executor directory or prepare command; those configure ticket worktrees.',
+      schema: z.object({
+        title: z.string().trim().min(1).optional().describe('The conversation\'s title, as orchestrator_worker_list reports it. Preferred over session.'),
+        session: z.string().min(1).optional().describe('The conversation\'s session id, for a blank or ambiguous title.'),
+        text: z.string().trim().min(1).max(8000).describe('What to say, in the conversation\'s own language.'),
+        wait_seconds: z.number().int().min(0).max(600).default(120)
+          .describe('How long to wait for that conversation\'s turn to end; 0 only delivers it.'),
+      }).strict(),
+      execute: async (args, signal) => {
+        const target = await resolveWorker(host, agent, args.title, args.session)
+        if ('error' in target) return { refused: target.error }
+        const { sessionId, title } = target
+        const resolved = await host.context.sessionController.resolveAgent(sessionId as never)
+        if ('error' in resolved) return { refused: `Unknown conversation: ${sessionId}` }
+        const worker = resolved.agent
+        const from = worker.session.snapshotEvents().length
+        await host.sessions.prompt(sessionId, key('router-message', agent.id, String(Date.now())), args.text, 'queue')
+        if (args.wait_seconds === 0) return { session: sessionId, title, delivered: true, finished: false }
+        const finished = await untilIdle(worker, args.wait_seconds * 1000, signal)
+        const reply = answerAfter(worker, from)
+        return { session: sessionId, title, delivered: true, finished, ...(reply ? { reply } : {}) }
       },
     }),
   ]

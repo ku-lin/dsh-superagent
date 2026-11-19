@@ -5,7 +5,7 @@ import { canRetry, followupOwners, latestReport, liveTicket, settled, threadKey,
 import { allowedSender, listedBot } from '../../policy.ts'
 import type { ChannelLink, Localized } from '../../sources/kind.ts'
 import type { SourceRegistry } from '../../sources/registry.ts'
-import { workerSessionId } from '../../executor/dsh.ts'
+import { executionSessionId } from '../../executor/dsh.ts'
 import type { Store } from '../store.ts'
 import { attribute, markdown, plain, preview, readable } from './text.ts'
 
@@ -125,8 +125,8 @@ export function ticketSummary(ticket: Ticket) {
       assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
     // Every started Assignment of a Ticket runs in its one shared worker Session.
     deliveryError: attribute(ticket.delivery?.error), sessionId: ticket.assignments.some(item => item.startedAt)
-      ? workerSessionId(ticket.id) : '',
-    directory: attribute(ticket.execution?.directory), summary: latestReport(ticket)?.summary ?? '', createdAt: ticket.createdAt,
+      ? executionSessionId(ticket) : '',
+    borrowedSessionId: ticket.execution?.borrowedSession?.sessionId, directory: attribute(ticket.execution?.directory), summary: latestReport(ticket)?.summary ?? '', createdAt: ticket.createdAt,
     updatedAt: ticket.updatedAt }
 }
 export type TicketSummaryView = ReturnType<typeof ticketSummary>

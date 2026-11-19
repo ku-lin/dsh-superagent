@@ -1,5 +1,6 @@
 /** Root panel shell: header with global search and glossary, top-level navigation tabs, and active route view. */
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SearchView } from './api.ts'
 import { Button, Dot, Icon, Input, Modal, SegmentedTabs } from './controls.tsx'
 import type { DeploymentForm } from './deployment.tsx'
@@ -18,9 +19,11 @@ import { ThreadPage } from './thread.tsx'
 import { TicketPage } from './ticket.tsx'
 import { TriggerStatus } from './trigger.tsx'
 import { When } from './widgets.tsx'
+import { WorkerPanel } from './worker.tsx'
 
 export interface AppProps {
   t: T; openSession: (sessionId: string) => Promise<void>
+  sessions?: Pick<ISessions, 'list' | 'refresh'>
   deploymentForm: DeploymentForm
 }
 
@@ -138,7 +141,7 @@ function Header({ masterId }: { masterId: string | undefined }) {
   </header>
 }
 
-function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm }) {
+function Pages({ route, openTab, deploymentForm, sessions }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm; sessions: AppProps['sessions'] }) {
   const { t } = usePanel()
   const { state, error, reload } = usePanelData()
   // Keep the active tab scrolled into view on narrow screens when routes change via links.
@@ -147,6 +150,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
   const page = (() => {
     switch (route.page) {
       case 'overview': return <OverviewPage />
+      case 'worker': return <WorkerPanel />
       case 'source': return <SourceStatus />
       case 'trigger': return route.id !== undefined ? <ThreadPage key={route.id} id={route.id} target={route.query?.trigger} />
         : <TriggerStatus filter={route.query?.filter ?? 'subscribed'} />
@@ -170,7 +174,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
 }
 
 /** Root panel component managing route history and shared panel state. */
-export function App({ t, openSession, deploymentForm }: AppProps) {
+export function App({ t, openSession, deploymentForm, sessions }: AppProps) {
   const [location, setLocation] = useState(initialLocation)
   useEffect(() => { remember(location) }, [location])
   // Preserve the last opened settings group across navigation so the Settings tab reopens at it.
@@ -183,6 +187,6 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
   return <PanelProvider t={t} openSession={openSession} navigate={navigate} back={back} backLabel={routeLabel(t, location.stack.at(-1) ?? HOME)}>
-    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} />
+    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} sessions={sessions} />
   </PanelProvider>
 }
