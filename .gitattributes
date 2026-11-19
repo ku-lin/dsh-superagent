@@ -1,0 +1,8 @@
+# Keep a POSIX checkout runnable: one line-ending policy for every text file.
+# `scripts/dsh-superagent` has a python3 shebang and must stay LF.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.tgz binary
