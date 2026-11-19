@@ -16,24 +16,31 @@ function setup(waitForChildren: (agent: Agent) => Promise<boolean>, drainChildre
   return { ctx, agent, jobs, subagents }
 }
 
-it('is not quiet when an end during the subagent check woke the worker, whose own idle looks again', async () => {
-  const { ctx, agent, jobs } = setup(async () => {
-    // The job settles meanwhile, and its end wakes the worker.
-    jobs.end(id); (agent as { status: string }).status = 'running'
-    return false
-  })
+it('is not quiet when the worker runs again while a look waits on its job', async () => {
+  const { ctx, agent, jobs } = setup(async () => false)
   const id = jobs.run('worker-t1')
-  expect(await untilQuiet(ctx, agent, new AbortController().signal)).toBe(false)
+  const quiet = untilQuiet(ctx, agent, new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  // Its job ends, and its end wakes the worker, whose own turn is what the next look sees.
+  ;(agent as { status: string }).status = 'running'
+  jobs.end(id)
+  expect(await quiet).toBe(false)
 })
 
-it('stops waiting for subagents that never settle once the host stops', async () => {
-  let joining!: () => void
-  const joined = new Promise<void>(resolve => { joining = resolve })
-  const { ctx, agent } = setup(() => { joining(); return new Promise(() => {}) })
+// A worker is an ordinary conversation that talks to the Router, not a parent of subagents: a leftover subagent of the
+// Session, such as one a person started in a borrowed conversation, must not hold a ticket's turn open.
+it('is quiet with its own jobs ended, and never waits on a subagent that would never settle', async () => {
+  const { ctx, agent, subagents } = setup(() => new Promise(() => {}))
+  expect(await untilQuiet(ctx, agent, new AbortController().signal)).toBe(true)
+  expect(subagents.waitForChildren).not.toHaveBeenCalled()
+})
+
+it('stops waiting for the worker once the host stops', async () => {
+  const { ctx, agent, jobs } = setup(async () => false)
+  jobs.run('worker-t1')
   const stop = new AbortController()
   const quiet = untilQuiet(ctx, agent, stop.signal)
-  // The host stops while the wait for its subagents runs.
-  await joined
+  await new Promise(resolve => setTimeout(resolve, 0))
   stop.abort()
   expect(await quiet).toBe(false)
 })
@@ -51,7 +58,7 @@ it('looks at the jobs only when one ends, not at each output of a noisy one', as
   expect(await quiet).toBe(true)
 })
 
-it('joins a worker\'s subagents once for the looks that wait on them, as DSH cannot cancel the join', async () => {
+it('does not consult the subagents service on any look', async () => {
   const { ctx, agent, subagents } = setup(() => new Promise(() => {}))
   for (let look = 0; look < 3; look++) {
     const stop = new AbortController()
@@ -59,7 +66,7 @@ it('joins a worker\'s subagents once for the looks that wait on them, as DSH can
     stop.abort()
     expect(await quiet).toBe(false)
   }
-  expect(subagents.waitForChildren).toHaveBeenCalledTimes(1)
+  expect(subagents.waitForChildren).not.toHaveBeenCalled()
 })
 
 it('gives up a release of subagents that does not end within 10 seconds, and cancels the turn their ends woke', async () => {

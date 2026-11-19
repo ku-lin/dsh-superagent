@@ -233,7 +233,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       // The conversation must live in a Workspace the client already shows, or opening it reports the Session as unusable:
       // `sessions.ensure` creates it in that Workspace instead of one made from the plugin's own directory.
-      const workspace = await this.defaultWorkspaceId()
+      const workspace = await this.sessions.defaultWorkspace()
       await this.sessions.ensure(this.masterId, process.cwd(), ROUTER_TITLE, 'orchestrator', workspace?.id)
       if (this.store.get(KV.runtime.greeted) !== this.masterId) {
         // Queued, not injected: a Session whose only message waits for a turn is still a draft the client cannot open, and
@@ -246,18 +246,6 @@ export class Runtime extends Service implements SourceHost {
       const renamed = await this.ctx.sessionController.rename({ sessionId: this.masterId as SessionId, title: ROUTER_TITLE })
       if ('error' in renamed) this.ctx.logger.warn('dsh-superagent could not title its router conversation: %s', String(renamed.error))
     } catch (error) { this.ctx.logger.warn('dsh-superagent could not prepare its router conversation: %s', String(error)) }
-  }
-  /**
-   * The directory of the Workspace the client actually shows as the default. `initializeDefault` is the host's own answer to
-   * that question; the list order is not, because a Workspace created for some other Session can come first.
-   */
-  private async defaultWorkspaceId(): Promise<{ id: string; path?: string } | undefined> {
-    try {
-      const preferred = await this.ctx.workspaceRegistry.initializeDefault(async () => process.cwd()).catch(() => undefined)
-      if (preferred) return preferred
-      const listed = [...await this.ctx.workspaceRegistry.list()]
-      return listed.find(item => item.path?.toLowerCase() === process.cwd().toLowerCase()) ?? listed[0]
-    } catch { return undefined }
   }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.

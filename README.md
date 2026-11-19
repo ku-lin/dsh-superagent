@@ -1,6 +1,6 @@
 # dsh-superagent
 
-**Version 1.1.0** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
+**Version 1.2.0** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
@@ -23,7 +23,9 @@ A single chat session does not scale to a team: requests arrive from several pla
 The bundle defines two DSH agent presets, and they are the router/worker split:
 
 - **`dsh-superagent-router`** — the main Session, reduced to routing: no shell, no sandbox and no job tools, a **read-only** filesystem (`write` and `edit` off), skills and compaction. It routes; it does not run commands. Also absent: subagents, file search, web, todo list, questions to a person, presenting, plan mode, plugin manager, scheduling, goals and workflows.
-- **`dsh-superagent-worker`** — an Executor Session. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, spawned subagents, web search without fetch.
+- **`dsh-superagent-worker`** — an Executor Session, and an ordinary DSH conversation: it appears in the Workspace you have open, titled `worker-<id> · <ticket title>`, works in the Ticket's own directory, and can be opened and typed into like any other chat. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, web search without fetch.
+
+A worker spawns no subagents. It reports through the Ticket's own `orchestrator_*` tools, and the Router reaches it with `orchestrator_worker_list` / `orchestrator_worker_message`. A message is handed over and the call returns at once; the worker's answer comes back to the Router as an ordinary message in its own conversation when that turn ends, so the Router never waits on a timer.
 
 A foreground command or job wait in a worker longer than **5 seconds** moves to a background job, so a long command does not hold back the next candidate. Neither preset can be hidden from the preset picker — DSH has no setting for that — so their names and descriptions say whom they are for. **Do not select them for personal Sessions.** See [cordis.patch.yml](cordis.patch.yml), [docs/003-execution.md](docs/003-execution.md) and [docs/007-architecture.md](docs/007-architecture.md).
 

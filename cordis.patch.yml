@@ -93,22 +93,7 @@
                   thresholdChars: 8192
                   headChars: 4096
                   tailChars: 1024
-          - id: delegation
-            name: cordis:group
-            group: true
-            isolate:
-              workflowEngine: true
-            config:
-              - id: tool-subagent-control
-                name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent
-                name: '@deepseek-ai/dsh-tool-subagent'
-                config:
-                  provider: spawn
-                  toolName: subagent
-                  modelSelection: true
-                  modelDiscovery: true
-                  agentPreset: standard
+          # No delegation here: a worker is an ordinary conversation that talks to the Router, not a parent of subagents.
           - id: tool-todo
             name: '@deepseek-ai/dsh-tool-todo'
             config:

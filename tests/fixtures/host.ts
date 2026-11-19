@@ -166,8 +166,20 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const tools = new Map<string, Map<string, RegisteredTool>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
+  /**
+   * The client's Workspaces. `initializeDefault` answers which one the client shows; a test may replace it to prove that a
+   * worker conversation joins that Workspace instead of one made from its ticket directory.
+   */
+  const workspaceRegistry = {
+    create: vi.fn(async (cwd: string) => ({ id: cwd })),
+    initializeDefault: vi.fn(async (_fallback: () => Promise<string>) => undefined as { id: string; path?: string } | undefined),
+    list: vi.fn(async () => [] as { id: string; path?: string }[]),
+  }
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
+    // The conversations the client catalog lists: every Session this host created, which is what the Router addresses by title.
+    list: vi.fn(async () => ({ items: [...agents.keys()].map(sessionId => ({ sessionId, running: agents.get(sessionId)!.status === 'running',
+      agentAvailable: true })) })),
     create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
@@ -239,7 +251,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
-    sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
+    sessionPersistence: persistence, workspaceRegistry, permissionPresets: { set: () => {} }, subprocess, webServer,
     jobs: jobs.service, subagents: subagents.service }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
@@ -294,6 +306,6 @@ export async function startRuntime(seed?: (store: Store) => void) {
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim }
+    jobs, subagents, step, claim, workspaceRegistry }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
