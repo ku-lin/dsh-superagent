@@ -383,13 +383,13 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_worker_message',
-      description: 'Send one message to an existing DSH conversation and return its answer. This is how the Router works: it routes; it does not do the work. Address it by `title` (as orchestrator_worker_list reports it) or, for a blank or shared title, by `session`. Deliveries need no executor directory or prepare command; those configure ticket worktrees.',
+      description: 'Send one message to an existing DSH conversation; the Router routes, it does not do the work. Address it by `title` (from orchestrator_worker_list) or, for a blank or shared title, by `session`. Deliveries need no executor directory or prepare command.',
       schema: z.object({
         title: z.string().trim().min(1).optional().describe('The conversation\'s title, as orchestrator_worker_list reports it. Preferred over session.'),
         session: z.string().min(1).optional().describe('The conversation\'s session id, for a blank or ambiguous title.'),
         text: z.string().trim().min(1).max(8000).describe('What to say, in the conversation\'s own language.'),
         wait_seconds: z.number().int().min(0).max(600).default(0)
-          .describe('0 delivers the message and returns at once, and the answer arrives later as a message in this conversation; a positive value also waits that long for the turn to end.'),
+          .describe('0 returns at once, and the answer arrives later as a message here; above 0 also waits that long for the turn to end.'),
       }).strict(),
       execute: async (args, signal) => {
         const target = await resolveWorker(host, agent, args.title, args.session)
