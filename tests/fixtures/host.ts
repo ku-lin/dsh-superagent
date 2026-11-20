@@ -167,20 +167,41 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
   /**
-   * The client's Workspaces. `initializeDefault` answers which one the client shows; a test may replace it to prove that a
-   * worker conversation joins that Workspace instead of one made from its ticket directory.
+   * The client's Workspaces, and the sessions each lists. `create` mirrors DSH: a Session joins one Workspace, takes that
+   * Workspace's path as its cwd, and `session.create` refuses `workspaceId` together with `cwd`. `attach` mirrors the
+   * Workspace's own check that a Session's cwd is its path, which is what made 1.2.0 create no worker at all.
    */
+  const workspaces = new Map<string, { id: string; path?: string; sessionIds: string[] }>()
   const workspaceRegistry = {
-    create: vi.fn(async (cwd: string) => ({ id: cwd })),
+    create: vi.fn(async (cwd: string) => {
+      const id = `ws:${cwd}`
+      if (!workspaces.has(id)) workspaces.set(id, { id, path: cwd, sessionIds: [] })
+      return { id, path: cwd }
+    }),
     initializeDefault: vi.fn(async (_fallback: () => Promise<string>) => undefined as { id: string; path?: string } | undefined),
-    list: vi.fn(async () => [] as { id: string; path?: string }[]),
+    list: vi.fn(async () => [...workspaces.values()].map(({ id, path }) => ({ id, path }))),
+    attach: vi.fn(async (workspaceId: string, sessionId: string, sessionCwd: string) => {
+      const workspace = workspaces.get(workspaceId)
+      if (!workspace) throw new Error(`workspace "${workspaceId}" not found`)
+      if (!samePath(sessionCwd, workspace.path ?? ''))
+        throw new Error(`cannot attach session '${sessionId}' to workspace '${workspace.path}': its cwd resolves to '${sessionCwd}'`)
+      if (!workspace.sessionIds.includes(sessionId)) workspace.sessionIds.unshift(sessionId)
+    }),
   }
+  const samePath = (a: string, b: string) => process.platform === 'win32'
+    ? a.toLowerCase() === b.toLowerCase() : a === b
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
     // The conversations the client catalog lists: every Session this host created, which is what the Router addresses by title.
     list: vi.fn(async () => ({ items: [...agents.keys()].map(sessionId => ({ sessionId, running: agents.get(sessionId)!.status === 'running',
       agentAvailable: true })) })),
-    create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+    create: vi.fn(async (options: { sessionId: string; workspaceId?: string; cwd?: string; agentPreset?: string }) => {
+      const { sessionId, workspaceId } = options
+      // DSH refuses both at once, and a Session that joins a Workspace takes its path as `cwd`.
+      if (workspaceId !== undefined && options.cwd !== undefined)
+        throw new Error('session.create accepts workspaceId or cwd, not both')
+      const joined = workspaceId !== undefined ? workspaces.get(workspaceId) : undefined
+      if (workspaceId !== undefined && !joined) throw new Error(`workspace "${workspaceId}" not found`)
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
@@ -240,6 +261,8 @@ export async function startRuntime(seed?: (store: Store) => void) {
         get status() { return status }, set status(next: string) { status = next; if (next === 'idle') for (const wake of idle.splice(0)) wake() },
         // Once its turn ended, as DSH's does.
         whenIdle: () => status === 'idle' ? Promise.resolve() : new Promise<void>(resolve => { idle.push(resolve) }) } as never)
+      // Joining a Workspace is what puts the conversation in the list a person sees, and it checks the cwd it was given.
+      if (joined) await workspaceRegistry.attach(joined.id, sessionId, joined.path ?? '')
     }),
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(resolveDefault), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
@@ -306,6 +329,6 @@ export async function startRuntime(seed?: (store: Store) => void) {
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim, workspaceRegistry }
+    jobs, subagents, step, claim, workspaceRegistry, workspaces }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

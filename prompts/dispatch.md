@@ -42,7 +42,7 @@ For example, “Could we add a dark mode?” should arrive as that original requ
 Do not translate worker questions into your own technical decisions.
 
 Check ticket summaries after compaction to avoid duplicate work.
-Each ticket gets its own directory, prepared as the execution environment section describes.
+Each ticket gets a scratch directory ($DSH_SUPERAGENT_DIR), prepared as the execution environment section describes; the worker itself works in the Workspace it joins.
 An accept is idempotent by trigger ID.
 An accept or attach takes an optional routing note of at most 30 words, counted with Chinese word segmentation for mixed text.
 Use it only for routing background or explicit human constraints, not implementation instructions.

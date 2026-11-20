@@ -1083,20 +1083,36 @@ describe('the Executor\'s parts', () => {
 })
 
 describe('a worker is an ordinary conversation in the Workspace', () => {
-  it('creates it in the Workspace the client shows, keeps its ticket directory, and names it after the ticket', async () => {
-    h.workspaceRegistry.initializeDefault.mockResolvedValue({ id: 'ws-client', path: '/work' })
+  it('creates the worker by workspaceId alone, so it lands in that Workspace and is listed there', async () => {
+    await h.workspaceRegistry.create('/work')
+    h.workspaceRegistry.initializeDefault.mockResolvedValue({ id: 'ws:/work', path: '/work' })
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const created = h.controller.create.mock.calls
-      .map(([options]) => options as { sessionId: string; workspaceId: string; cwd?: string; agentPreset?: string })
+      .map(([options]) => options as { sessionId: string; workspaceId?: string; cwd?: string; agentPreset?: string })
       .find(options => options.sessionId === one.sessionId)!
-    // Joining the client's Workspace is what makes the conversation findable; `cwd` still keeps the ticket's directory.
-    expect(created.workspaceId).toBe('ws-client')
+    // DSH refuses `workspaceId` together with `cwd` — passing both is what made 1.2.0 create no worker at all.
+    expect(created.workspaceId).toBe('ws:/work')
+    expect('cwd' in created).toBe(false)
     expect(created.agentPreset).toBe('dsh-superagent-worker')
-    expect(created.cwd).toBe(h.runtime.store.tickets.get(one.ticket.id)!.execution!.directory)
+    // The conversation is in the Workspace a person sees, and in the Session catalog the panel lists.
+    expect(h.workspaces.get('ws:/work')!.sessionIds).toContain(one.sessionId)
+    const listed = await h.controller.list()
+    expect(listed.items.map(item => item.sessionId)).toContain(one.sessionId)
     const renames = (h.controller.rename as unknown as { mock: { calls: [{ sessionId: string; title: string }][] } }).mock.calls
     const renamed = renames.map(([options]) => options).find(options => options.sessionId === one.sessionId)
     expect(renamed?.title).toMatch(/^worker-\S+ · .+$/u)
     expect(renamed?.title).toContain(h.runtime.store.tickets.get(one.ticket.id)!.title)
+  })
+
+  it('runs one worker at a time in one Workspace, leaving the next Ticket pending', async () => {
+    await h.workspaceRegistry.create('/work')
+    h.workspaceRegistry.initializeDefault.mockResolvedValue({ id: 'ws:/work', path: '/work' })
+    const first = await h.acceptedTicket(feishu('1', '@bot 一'))
+    const second = await h.acceptedTicket(feishu('2', '@bot 二'))
+    // Two conversations in one checkout would tread on each other, so the second waits for the lease.
+    expect(h.workspaces.get('ws:/work')!.sessionIds).toContain(first.sessionId)
+    expect(h.workspaces.get('ws:/work')!.sessionIds).not.toContain(second.sessionId)
+    expect(latestAssignment(h.runtime.store.tickets.get(second.ticket.id)!)!.state).toBe('pending')
   })
 
   it('hands a message to a worker and returns without waiting for its turn', async () => {
