@@ -44,16 +44,6 @@ export function until<T>(work: Promise<T>, signal?: AbortSignal, ms?: number): P
 }
 /** The workers whose turn a stop of their subagents cancelled, whose next idle ends that turn rather than one of their own. */
 export const cancelled = new WeakSet<Agent>()
-/** The pending join of each worker's subagents, which DSH cannot cancel, so a later look joins the same one. */
-const joins = new WeakMap<Agent, Promise<boolean>>()
-function childrenEnd(subagents: Subagents, agent: Agent): Promise<boolean> {
-  let join = joins.get(agent)
-  if (!join) {
-    join = subagents.waitForChildren(agent).finally(() => { joins.delete(agent) })
-    joins.set(agent, join)
-  }
-  return join
-}
 
 /** A job by its id and the first line of its label. */
 const named = (job: { id: string; label?: string }) => { const line = job.label?.split('\n')[0]?.trim(); return line ? `${job.id} (${line})` : job.id }
@@ -95,11 +85,11 @@ function jobsEnd(ctx: Context, sessionId: string, signal: AbortSignal, except?: 
  */
 export async function untilQuiet(ctx: Context, agent: Agent, signal: AbortSignal, except?: ReadonlySet<string>): Promise<boolean> {
   for (;;) {
-    const subagents = subagentsOf(ctx)
-    const children = subagents ? await until(childrenEnd(subagents, agent), signal) : false
+    // A worker no longer spawns subagents, so only its own shell jobs can run on after its turn: nothing here waits on a
+    // child conversation, which is what made a ticket's end depend on a subagent's timer.
     const jobs = await jobsEnd(ctx, agent.id, signal, except)
     if (signal.aborted || agent.status !== 'idle') return false
-    if (!children && !jobs) return true
+    if (!jobs) return true
   }
 }
 

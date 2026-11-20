@@ -419,16 +419,14 @@ describe('a worker whose work runs in the background', () => {
     idle(one.sessionId)
     await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
   })
-  it('stays busy while a subagent of it works, and reports waiting once the turn its end woke it for ends', async () => {
+  it('reports waiting as soon as its own turn ends, even while a subagent it left still runs', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
     const child = h.subagents.spawn(one.sessionId)
-    idle(one.sessionId); await h.runtime.idle()
-    expect(latestAssignment(ticket())?.report).toBeUndefined()
-    h.subagents.settle(child)
-    expect(h.agents.get(one.sessionId)!.status).toBe('running')
     idle(one.sessionId)
+    // A worker is an ordinary conversation, not a parent of subagents: a leftover child does not hold its ticket open.
     await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
+    h.subagents.settle(child)
   })
   it('kills its shell jobs and releases its subagents when its ticket stops, whose ends wake no one, and lets it start new ones', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -635,13 +633,14 @@ describe('a worker whose work runs in the background', () => {
     expect(h.subagents.live(child)).toBe(true)
     expect(h.relays(h.runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'waiting' })
   })
-  it('says a worker\'s subagents still run when only they ran 30 minutes after the turn ended', async () => {
+  it('does not keep a ticket open for a subagent that ran on after the turn ended', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     h.subagents.spawn(one.sessionId)
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     try { idle(one.sessionId); await minutes(30) } finally { vi.useRealTimers() }
-    await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toMatchObject({ state: 'waiting',
-      summary: 'Subagents still ran 30 minutes after the worker\'s turn ended.' }))
+    await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report?.state).toBe('waiting'))
+    // The old behaviour named the leftover child at the 30-minute limit; the ticket must not wait on one at all.
+    expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report?.summary ?? '').not.toContain('Subagents still ran')
   })
   it('holds a delivery that reached a worker while a hand-off stopped its subagents until the stop ended', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -1080,5 +1079,32 @@ describe('the Executor\'s parts', () => {
       answers: 'tr9' })!
     expect(ready.id).toMatch(/^report:/)
     expect(JSON.parse(ready.text)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: 't1' }, trigger_id: 'tr1', state: 'ready', answer_to: 'tr9', summary: 'Done' })
+  })
+})
+
+describe('a worker is an ordinary conversation in the Workspace', () => {
+  it('creates it in the Workspace the client shows, keeps its ticket directory, and names it after the ticket', async () => {
+    h.workspaceRegistry.initializeDefault.mockResolvedValue({ id: 'ws-client', path: '/work' })
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const created = h.controller.create.mock.calls
+      .map(([options]) => options as { sessionId: string; workspaceId: string; cwd?: string; agentPreset?: string })
+      .find(options => options.sessionId === one.sessionId)!
+    // Joining the client's Workspace is what makes the conversation findable; `cwd` still keeps the ticket's directory.
+    expect(created.workspaceId).toBe('ws-client')
+    expect(created.agentPreset).toBe('dsh-superagent-worker')
+    expect(created.cwd).toBe(h.runtime.store.tickets.get(one.ticket.id)!.execution!.directory)
+    const renames = (h.controller.rename as unknown as { mock: { calls: [{ sessionId: string; title: string }][] } }).mock.calls
+    const renamed = renames.map(([options]) => options).find(options => options.sessionId === one.sessionId)
+    expect(renamed?.title).toMatch(/^worker-\S+ · .+$/u)
+    expect(renamed?.title).toContain(h.runtime.store.tickets.get(one.ticket.id)!.title)
+  })
+
+  it('hands a message to a worker and returns without waiting for its turn', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    // A running worker is what makes the Router's answer asynchronous instead of inline.
+    ;(h.agents.get(one.sessionId) as { status: string }).status = 'running'
+    const result = await h.runTool(h.runtime.masterId, 'orchestrator_worker_message', { session: one.sessionId, text: '进展如何？' })
+    // No timer and no inline wait: the message is handed over, and the answer comes back as a message in the Router's chat.
+    expect(result).toMatchObject({ session: one.sessionId, delivered: true, finished: false })
   })
 })

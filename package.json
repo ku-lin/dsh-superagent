@@ -1,10 +1,33 @@
 {
   "name": "dsh-superagent",
+  "version": "1.2.0",
+  "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "deepseek",
+    "agent",
+    "autonomous-agent",
+    "orchestrator",
+    "router",
+    "multi-agent",
+    "coding-agent",
+    "github",
+    "feishu",
+    "policy",
+    "automation",
+    "plugin"
+  ],
   "author": "DeepSeek Harness Team <team@dsh.dev>",
   "license": "MIT",
-  "version": "0.1.0",
-  "private": true,
-  "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ku-lin/dsh-superagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ku-lin/dsh-superagent/issues"
+  },
+  "homepage": "https://github.com/ku-lin/dsh-superagent#readme",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -24,8 +47,12 @@
     "cordis.patch.yml",
     "locale/*.json",
     "README.md",
+    "CHANGELOG.md",
+    "SETUP.md",
+    "docs",
     "prompts",
-    "skills"
+    "skills",
+    "examples"
   ],
   "dsh": {
     "bundle": {
@@ -48,13 +75,17 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm test && pnpm build"
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
     "dsh": "^0.2.1-alpha.2"
   },
   "packageManager": "pnpm@11.7.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "proper-lockfile": "4.1.2",
     "zod": "4.4.3"

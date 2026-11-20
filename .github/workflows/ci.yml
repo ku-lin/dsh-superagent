@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck, test, pack (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version comes from package.json "packageManager".
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # One retry as insurance: several source tests wait on real subprocesses with
+      # `waitFor` timeouts, which are sensitive to a loaded runner.
+      - name: Test
+        run: pnpm test -- --retry=1
+
+      - name: Build
+        run: pnpm build
+
+      - name: Check build output
+        run: test -f lib/index.js && test -f lib/client.js
+
+      - name: Check package contents
+        run: npm pack --dry-run
