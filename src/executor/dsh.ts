@@ -79,7 +79,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'borrow' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'borrow' | 'prompt' | 'promptedId' | 'relay' | 'holds' | 'workerWorkspace'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -234,6 +234,8 @@ export class DshExecutor implements Executor {
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
   private readonly personal = new Map<string, string>()
+  /** The ticket holding each Workspace's lease, so two worker conversations never share one checkout. */
+  private readonly workspaceLeases = new Map<string, string>()
   /** A borrowed conversation's turn belongs to a ticket only after claiming its delivery. */
   private readonly borrowedClaims = new Map<string, number>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
@@ -381,6 +383,8 @@ export class DshExecutor implements Executor {
     const sessionId = executionSessionId(ticket)
     this.host.store.afterCommit(() => {
       this.settling.get(ticket.id)?.abort()
+      // The Assignment is over, so the Workspace is free for the next worker.
+      this.releaseWorkspace(ticket.id)
       if (!ticket.execution?.borrowedSession) {
         if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
         // Owned workers alone have background processes managed by this executor.
@@ -437,7 +441,24 @@ export class DshExecutor implements Executor {
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
+    // A failed launch holds nothing: the Workspace goes back to the pool for the next worker.
+    this.releaseWorkspace(ticketId)
     this.failed(ticketId, String(error))
+  }
+  /**
+   * Takes the lease of `workspaceId` for `ticketId`, so two worker conversations never share one checkout. A lease is held
+   * from the launch until the Assignment ends; a launch that finds it taken throws `Later`, which the effect queue retries,
+   * so Tickets waiting on one Workspace run one after another while Tickets of other Workspaces run in parallel.
+   */
+  private leaseWorkspace(ticketId: string, workspaceId: string | undefined): void {
+    if (!workspaceId) return
+    const held = this.workspaceLeases.get(workspaceId)
+    if (held !== undefined && held !== ticketId) throw new Later(`Another worker is already working in Workspace ${workspaceId}`)
+    this.workspaceLeases.set(workspaceId, ticketId)
+  }
+  /** Releases whatever lease `ticketId` holds. */
+  private releaseWorkspace(ticketId: string): void {
+    for (const [workspaceId, held] of this.workspaceLeases) if (held === ticketId) this.workspaceLeases.delete(workspaceId)
   }
   /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
   private failed(ticketId: string, summary: string): void {
@@ -456,8 +477,13 @@ export class DshExecutor implements Executor {
     }
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
+    // The conversation works in the Workspace it joins, exactly as one made by hand there: the ticket directory is scratch
+    // for logs and artifacts. One worker per Workspace, because two conversations would share one checkout.
+    const target = (await this.host.sessions.workerWorkspace(this.host.store.settings().executor.workspace)).workspace
     if (!current()) return
-    // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
+    this.leaseWorkspace(ticket.id, target?.id)
+    if (!current()) return
+    // Prepare the ticket's scratch directory once; an existing directory counts as already prepared.
     if (!await stat(workspace).then(() => true, () => false)) {
       await this.prepareDirectory(ticket)
       if (!current()) return
@@ -469,7 +495,7 @@ export class DshExecutor implements Executor {
         if ('error' in result) throw result.error
         return result.agent
       })
-      : await this.host.sessions.ensure(sessionId, workspace, workerTitle(ticket), 'worker')
+      : await this.host.sessions.ensure(sessionId, workspace, workerTitle(ticket), 'worker', target?.id)
     if (!current()) return
     if (ticket.execution?.borrowedSession) await this.host.sessions.borrow(agent, ticket)
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.

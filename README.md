@@ -1,6 +1,6 @@
 # dsh-superagent
 
-**Version 1.2.0** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
+**Version 1.2.1** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
@@ -23,7 +23,9 @@ A single chat session does not scale to a team: requests arrive from several pla
 The bundle defines two DSH agent presets, and they are the router/worker split:
 
 - **`dsh-superagent-router`** — the main Session, reduced to routing: no shell, no sandbox and no job tools, a **read-only** filesystem (`write` and `edit` off), skills and compaction. It routes; it does not run commands. Also absent: subagents, file search, web, todo list, questions to a person, presenting, plan mode, plugin manager, scheduling, goals and workflows.
-- **`dsh-superagent-worker`** — an Executor Session, and an ordinary DSH conversation: it appears in the Workspace you have open, titled `worker-<id> · <ticket title>`, works in the Ticket's own directory, and can be opened and typed into like any other chat. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, web search without fetch.
+- **`dsh-superagent-worker`** — an Executor Session, and an ordinary DSH conversation: it joins the Workspace a person would open a conversation in, appears there in the list, is titled `worker-<id> · <ticket title>`, works **in that Workspace's directory**, and can be opened and typed into like any other chat. It has the tools needed to do the work: writable filesystem, shell, file search, todo list, web search without fetch.
+
+Its ticket directory (`$DSH_SUPERAGENT_DIR`) is scratch for logs, evidence and temporary files, not the checkout: relative paths, `git status` and build output are the Workspace's, exactly as in a conversation you start by hand. The worker can be pointed at a specific directory with the Execution setting `workspace`; empty means the Workspace the client shows. **One worker runs per Workspace at a time** — two conversations in one checkout would tread on each other — so tickets of the same repository queue while different Workspaces still run in parallel.
 
 A worker spawns no subagents. It reports through the Ticket's own `orchestrator_*` tools, and the Router reaches it with `orchestrator_worker_list` / `orchestrator_worker_message`. A message is handed over and the call returns at once; the worker's answer comes back to the Router as an ordinary message in its own conversation when that turn ends, so the Router never waits on a timer.
 
@@ -134,6 +136,8 @@ Because `engines.dsh` names a prerelease, DSH's compatibility gate rejects newer
 Honest list — several of these are the difference between "runs" and "supported".
 
 - **Research prototype.** Not production-ready, not an official DeepSeek product, and reviewed by nobody outside its authors. Expect bugs.
+- **A worker runs in your project directory, with no fence.** Because a worker is a conversation in the Workspace like any other, its shell starts in — and can write anywhere inside — that checkout, and both presets run with `danger-full-access` as your OS user. There is no sandbox between a worker and the code you are editing. Use a dedicated OS account or a dedicated checkout if that matters, and keep the Policy's allowed list short.
+- **One worker per Workspace.** Two conversations in one checkout would tread on each other, so tickets of the same repository run one at a time regardless of `maxWorkers`; the rest queue. Different Workspaces still run in parallel.
 - **`scripts/dsh-superagent` is POSIX-only.** It imports `fcntl` and shells out to `ps`/`tmux`. On Windows use it under WSL, or start the profile yourself and skip the script's log and control handling.
 - **Not on npm.** Install is from source and needs a build step; there is no versioned artifact on the registry yet.
 - **Exact peer versions.** The `@deepseek-ai/*` peer dependencies are pinned to the `0.2.1-alpha.2` line (`@deepseek-ai/cordis` to `4.0.5-alpha.1`, `@deepseek-ai/schemastery` to `3.18.5-alpha.1`). A newer DSH may refuse the bundle.

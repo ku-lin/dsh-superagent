@@ -26,7 +26,9 @@ Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory 
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. A worker is an ordinary conversation in the Workspace the client shows, titled `worker-<id> · <ticket title>`; it works in the Ticket's own directory. It does not spawn subagents: it reports through the Ticket's `orchestrator_*` tools, and the Router talks to it with `orchestrator_worker_message`.
+The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. A worker is an ordinary conversation in the Workspace a person would open one in — the Execution setting `workspace`, or the Workspace the client shows when that is empty — titled `worker-<id> · <ticket title>`, and it works in that Workspace's directory: relative paths, `git status` and build output are that directory's. Its ticket directory (`$DSH_SUPERAGENT_DIR`) is scratch for logs, evidence and temporary files. It does not spawn subagents: it reports through the Ticket's `orchestrator_*` tools, and the Router talks to it with `orchestrator_worker_message`.
+
+A Session joins exactly one Workspace and takes that Workspace's path as its cwd, which is why the plugin never passes a workspace and a directory together. One worker runs per Workspace at a time, because two conversations in one checkout would tread on each other; Tickets of the same repository queue while different Workspaces still run in parallel.
 
 ### Background work and worker slots
 

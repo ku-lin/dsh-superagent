@@ -4,7 +4,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
+import { dirname, normalize } from 'node:path'
+import { realpath } from 'node:fs/promises'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
@@ -61,6 +62,11 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write']
+/** Whether two directory paths name the same place: normalized, and case-folded on Windows, where paths are case-insensitive. */
+const samePath = (a: string, b: string): boolean => {
+  const fold = (value: string) => process.platform === 'win32' ? normalize(value).toLowerCase() : normalize(value)
+  return fold(a) === fold(b)
+}
 /**
  * Tools the router conversation keeps. It routes; it does not work. No shell, no job control, no writes: the only way it can
  * change anything is through its own `orchestrator_*` tools, which act on Tickets and other conversations. `read` stays for
@@ -156,13 +162,17 @@ export class Sessions {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
-      // A worker conversation belongs in the Workspace the client shows, like the router's: a person has to be able to open
-      // it. Only a host with no Workspace at all falls back to one made from the ticket directory.
-      const joining = workspaceId ?? (await this.defaultWorkspace())?.id
-      const workspace = joining ? { id: joining } : await ctx.workspaceRegistry.create(cwd)
+      // A conversation joins a Workspace, and DSH refuses `workspaceId` together with `cwd`: passing both is the bug that
+      // made 1.2.0 create no worker at all. A worker therefore joins the Workspace it should be found in and takes that
+      // Workspace's path as its cwd — exactly what creating a conversation there does.
+      const joining = workspaceId ?? (role === 'worker'
+        ? (await this.workerWorkspace(this.host.store.settings().executor.workspace)).workspace?.id
+        : (await this.defaultWorkspace())?.id)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id as never, cwd,
-        agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+      const preset = role === 'worker' ? WORKER_PRESET : ROUTER_PRESET
+      await (joining
+        ? ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: joining as never, agentPreset: preset })
+        : ctx.sessionController.create({ sessionId: id as SessionId, cwd, agentPreset: preset }))
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
@@ -212,6 +222,22 @@ export class Sessions {
       const listed = [...await this.ctx.workspaceRegistry.list()]
       return listed.find(item => item.path?.toLowerCase() === process.cwd().toLowerCase()) ?? listed[0]
     } catch { return undefined }
+  }
+  /**
+   * The Workspace a worker conversation joins. `path` names the directory a person would open a conversation in: the
+   * registered Workspace whose path is that directory (matched after `realpath`) is reused, and a directory with no
+   * Workspace yet is registered for it — the same thing opening a conversation there does. An empty `path` means the
+   * Workspace the client shows as its default.
+   */
+  async workerWorkspace(path: string): Promise<{ workspace?: { id: string; path?: string } }> {
+    const wanted = path.trim()
+    if (!wanted) return { workspace: await this.defaultWorkspace() }
+    const target = await realpath(wanted).catch(() => normalize(wanted))
+    // `list()` answers synchronously, and a host without a workspace registry must not stop the launch.
+    const listed = ((): { id: string; path?: string }[] => { try { return [...this.ctx.workspaceRegistry.list()] } catch { return [] } })()
+    const match = listed.find(item => !!item.path && samePath(item.path, target))
+    if (match) return { workspace: match }
+    return { workspace: await this.ctx.workspaceRegistry.create(wanted) }
   }
   /** Remove ticket tools when a loan ends without disposing the person's conversation. */
   releaseTicket(ticketId: string): void {

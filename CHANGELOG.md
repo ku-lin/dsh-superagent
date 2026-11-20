@@ -9,6 +9,58 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [1.2.1] - 2026-11-20
+
+Fixes a hard regression in 1.2.0 and makes a worker conversation **identical to one a person
+creates in that Workspace**.
+
+### Fixed
+
+- **1.2.0 created no worker at all.** It called
+  `sessionController.create({ workspaceId, cwd, agentPreset })`, and DSH refuses both at once
+  (`session.create accepts workspaceId or cwd, not both`), so every worker launch failed and no
+  worker conversation ever existed. A second rule of the same API makes the 1.2.0 design
+  impossible anyway: a Session that joins a Workspace takes **that Workspace's path** as its
+  cwd, and the Workspace's own `attachSession` rejects a Session whose cwd is not its path.
+  The plugin now passes **`workspaceId` alone**, exactly as creating a conversation in that
+  Workspace does.
+
+### Changed
+
+- **The worker's cwd is the Workspace directory.** Relative paths, `git status` and build
+  output land where they would in a conversation you start by hand. The ticket directory
+  (`$DSH_SUPERAGENT_DIR`) is demoted to scratch for logs, evidence and temporary files; it is
+  no longer the Session's cwd and the worker prompt says so.
+- **New Execution setting `workspace`** (absolute path, empty by default). Empty means the
+  Workspace the client shows; a path is resolved by `realpath` and matched exactly against
+  the registered Workspaces, and a directory with no Workspace yet is registered for it —
+  the same thing opening a conversation there does.
+- **One worker per Workspace.** A lease is held from launch until the Assignment ends, so two
+  tickets of the same repository never share a checkout; the second stays pending and is
+  retried by the effect queue. Different Workspaces still run in parallel. With one
+  repository configured, this means workers run one at a time regardless of `maxWorkers`.
+
+### Upgrade notes
+
+1. **Restart the dsh-superagent profile.** The change is in the plugin and in its presets.
+2. **Workers run in your project directory now.** `danger-full-access` has no fence around
+   it: a worker's shell can write anywhere in that checkout. README's Limitations say so
+   plainly. Use a dedicated checkout or OS account if that matters.
+3. **Ticket worktrees are no longer the working directory.** An existing `prepare` command
+   still runs and its directory is still created, but it is scratch; a team that relied on a
+   worker editing an isolated worktree should point `workspace` at the directory it wants
+   workers to work in.
+4. Concurrency drops to one worker per Workspace, as above.
+
+### Tests
+
+The fixture now mirrors both DSH rules — `create` refuses `workspaceId` with `cwd`, and
+`attach` rejects a Session whose cwd is not the Workspace path — so this regression cannot
+come back silently. New cases assert that a worker is created by `workspaceId` alone, that it
+lands in that Workspace's `sessionIds` and in the Session catalog, and that a second ticket in
+one Workspace stays pending. `cards.spec.ts` keeps the worker prompt under its character
+budget after the prompt rewrite.
+
 ## [1.2.0] - 2026-11-19
 
 A worker becomes an ordinary conversation you can find and talk to, and the Router
