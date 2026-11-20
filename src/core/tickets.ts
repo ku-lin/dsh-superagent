@@ -260,6 +260,8 @@ export class Tickets extends EnginePart {
     if (first?.kind !== 'trigger') return
     const at = this.now()
     delete ticket.ended; ticket.updatedAt = at
+    // A finished loan does not authorize silently borrowing the person's Session again on a later human follow-up.
+    if (ticket.execution?.borrowedSession) delete ticket.execution.borrowedSession
     const assignment = this.newAssignment(ticket)
     // Prepend the resumed marker so it is delivered ahead of the waiting messages.
     const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at }

@@ -36,6 +36,7 @@ export class Assignments extends EnginePart {
     const assignment = ticket.assignments.find(item => item.id === assignmentId)
     if (!assignment || assignment.state === 'ended') return
     assignment.state = 'running'; assignment.startedAt ??= this.now()
+    assignment.sessionId ??= ticket.execution?.borrowedSession?.sessionId ?? `worker-${ticket.id}`
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     if (liveTicket(ticket) && ticket.undelivered.length) this.options.executor.deliver(ticket, assignment)

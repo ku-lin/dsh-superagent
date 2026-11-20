@@ -5,7 +5,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
-import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
+import { latestAssignment, liveTicket } from '../core/index.ts'
+import type { RouterSessionRow } from './router-sessions.ts'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
@@ -30,6 +32,22 @@ import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
 export interface HttpHost {
   readonly store: Store
+  /** Read-only DSH catalog; resolving a selected agent does not initialize a worker preset. */
+  listDshSessions(): Promise<readonly SessionSummary[]>
+  /** Router-level Sessions only, from the durable headers: the virtual Router workspace's whole data source. */
+  routerSessions(): Promise<{ masterId: string; items: RouterSessionRow[] }>
+  /** The router conversation's last exchanges (newest last). */
+  routerChat(limit: number): Promise<{ sessionId: string; items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] }>
+  /** Delivers one message into the router conversation. */
+  routerSend(text: string): Promise<{ sent: true }>
+  /** True when no Source is enabled: nothing can open a Ticket, but the Router still works. */
+  sourceless(): boolean
+  /** Counts of the router transcript's event types (diagnostics for the chat view). */
+  routerEventTypes(): Promise<{ counts: { type: string; count: number }[] }>
+  /** One transcript event of a kind, verbatim (diagnostics for the chat view). */
+  routerEventSample(type: string): Promise<{ found: string | null }>
+  /** Optional read-only market service, resolved by the hosting DSH context. */
+  pluginMarket?: { listIndexes(): { url: string; title?: string | Record<string, string>; error?: string }[]; search(url: string, query: { text: string; sort: { kind: 'relevance' }; offset: number; limit: number }): Promise<{ entries: readonly { name: string; title?: string | Record<string, string>; description?: string | Record<string, string>; defaultVersion?: string; installation: { status: string } }[]; total: number; nextOffset: number | null }> }
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
@@ -37,7 +55,7 @@ export interface HttpHost {
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
-  readonly executor: Pick<DshExecutor, 'activeCount'>
+  readonly executor: Pick<DshExecutor, 'activeCount' | 'bindingInProgress'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -58,7 +76,7 @@ export interface HttpHost {
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404, message: string) { super(message) } }
+class RouteError extends Error { constructor(readonly status: 400 | 404 | 409, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -155,7 +173,7 @@ function routes(runtime: HttpHost): Routes {
   return {
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
-      executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
+      executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem, runtime.sourceless()),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
@@ -190,6 +208,75 @@ function routes(runtime: HttpHost): Routes {
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
+    'GET plugin-indexes': () => ({ available: !!runtime.pluginMarket, items: runtime.pluginMarket?.listIndexes() ?? [] }),
+    'GET plugin-search': async ({ query }) => {
+      const market = runtime.pluginMarket
+      if (!market) throw new RouteError(404, 'Plugin market is unavailable')
+      const url = query.url ?? ''
+      if (!market.listIndexes().some(index => index.url === url)) throw new RouteError(400, 'Select a configured plugin index')
+      const result = await market.search(url, { text: (query.text ?? '').slice(0, 200), sort: { kind: 'relevance' }, offset: 0, limit: 30 })
+      return { entries: result.entries.map(entry => ({ name: entry.name, ...entry.title ? { title: entry.title } : {},
+        ...entry.description ? { description: entry.description } : {}, version: entry.defaultVersion,
+        installation: entry.installation.status })), total: result.total, nextOffset: result.nextOffset }
+    },
+    'GET router-events': () => runtime.routerEventTypes(),
+    'GET router-event-sample': ({ query }) => runtime.routerEventSample(query.type ?? 'user/message'),
+    'GET router-sessions': () => runtime.routerSessions(),
+    'GET router-chat': async ({ query }) => {
+      const limit = Math.min(Math.max(Number(query.limit ?? 40) || 40, 1), 200)
+      return runtime.routerChat(limit)
+    },
+    'POST router-chat': async ({ body }) => {
+      const { text } = z.object({ text: z.string().trim().min(1).max(8000) }).strict().parse(await body())
+      return runtime.routerSend(text)
+    },
+    'GET dsh-sessions': async () => {
+      const leases = new Map(store.tickets.open().flatMap(ticket => ticket.execution?.borrowedSession
+        ? [[ticket.execution.borrowedSession.sessionId, ticket] as const] : []))
+      // A host can hold hundreds of Sessions; the Router acts only on those it can borrow, already leases, or sees running.
+      const shown = (await runtime.listDshSessions()).map(session => {
+        const lease = leases.get(session.sessionId)
+        // The host list may carry the title itself or as a `title` projection value; the panel shows the title, never the id.
+        const titled = session as typeof session & { title?: string; projectionValues?: { title?: string } }
+        const title = titled.title ?? titled.projectionValues?.title
+        return { ...session, ...(title ? { title } : {}), leased: !!lease,
+          borrowable: session.agentAvailable && !session.running && session.origin !== 'subagent'
+            && session.sessionId !== runtime.masterId && !session.sessionId.startsWith('worker-')
+            && !lease }
+      }).filter(session => session.borrowable || session.leased || session.running || session.sessionId.startsWith('worker-'))
+        .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 30)
+      return { items: shown.map(({ leased: _leased, ...session }) => {
+        const lease = leases.get(session.sessionId)
+        return lease ? { ...session, leasedToTicketId: lease.id, ticketTitle: lease.title } : session
+      }) }
+    },
+    'POST tickets/:id/worker-session': async ({ params, body }) => {
+      const { sessionId } = z.object({ sessionId: z.string().min(1).max(300) }).strict().parse(await body())
+      const existing = store.tickets.get(params.id)
+      if (!existing) throw new RouteError(404, 'Ticket not found')
+      const previous = existing.execution?.borrowedSession
+      if (previous?.sessionId === sessionId) return { ticketId: params.id, sessionId, boundAt: previous.boundAt, unchanged: true }
+      const available = await runtime.listDshSessions()
+      const session = available.find(item => item.sessionId === sessionId)
+      if (!session || !session.agentAvailable || session.running || session.origin === 'subagent'
+        || sessionId === runtime.masterId || sessionId.startsWith('worker-'))
+        throw new RouteError(404, 'Borrowable DSH Session not found')
+      return store.atomic(() => {
+        const current = store.tickets.get(params.id)
+        if (!current) throw new RouteError(404, 'Ticket not found')
+        const bound = current.execution?.borrowedSession
+        if (bound?.sessionId === sessionId) return { ticketId: params.id, sessionId, boundAt: bound.boundAt, unchanged: true }
+        if (!liveTicket(current) || !current.execution || latestAssignment(current)?.state !== 'pending'
+          || current.assignments.some(item => !!item.startedAt) || bound
+          || runtime.executor.bindingInProgress(params.id))
+          throw new RouteError(409, 'Ticket worker binding requires an unstarted assignment without a prior loan')
+        if (store.tickets.open().some(ticket => ticket.id !== params.id && ticket.execution?.borrowedSession?.sessionId === sessionId))
+          throw new RouteError(409, 'DSH Session is already leased to another open ticket')
+        const boundAt = new Date().toISOString()
+        store.tickets.save({ ...current, execution: { ...current.execution, borrowedSession: { sessionId, boundAt } } })
+        return { ticketId: params.id, sessionId, boundAt, unchanged: false }
+      })
+    },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),

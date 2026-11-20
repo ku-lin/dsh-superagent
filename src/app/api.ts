@@ -1,6 +1,7 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
-import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { PromptConfig, Prompts } from './prompts.ts'
+import type { RouterSessionRow } from './router-sessions.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
@@ -32,6 +33,26 @@ export interface Api {
   'POST decisions/:id/dismiss': { response: { dismissed: true } }
   'GET tickets': { query?: Paged & { state?: TicketFilter }; response: TicketListView }
   'GET tickets/:id': { response: TicketPageView }
+  /** Read-only DSH catalog. `title` is the conversation title the host projects; leasedToTicketId marks the exclusive lease reserved by a ticket (including one that can reopen). */
+  'GET dsh-sessions': { response: { items: (SessionSummary & { title?: string; leasedToTicketId?: string; ticketTitle?: string; borrowable: boolean })[] } }
+  /**
+   * Router-level Sessions only: every stored Session whose header ran the router preset, plus its direct children, and
+   * the permanent conversation's id. This is the virtual Router workspace's whole data source, so it selects on the
+   * durable header rather than the `agentPreset` projection (which reads `standard` for a Session created before the
+   * preset registry composed it).
+   */
+  'GET router-sessions': { response: { masterId: string; items: RouterSessionRow[] } }
+  /** The permanent router conversation: its last exchanges, and the route that speaks into it. */
+  'GET router-chat': { query?: { limit?: number }; response: { sessionId: string; items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] } }
+  'POST router-chat': { body: { text: string }; response: { sent: true } }
+  'GET router-events': { response: { counts: { type: string; count: number }[] } }
+  'GET router-event-sample': { query?: { type?: string }; response: { found: string | null } }
+  /** Read-only list of configured plugin market sources; no network fetch. */
+  'GET plugin-indexes': { response: { available: boolean; items: { url: string; title?: string | Record<string, string>; error?: string }[] } }
+  /** Explicit read-only search of one configured plugin market source; never installs. */
+  'GET plugin-search': { query?: { url?: string; text?: string }; response: { entries: { name: string; title?: string | Record<string, string>; description?: string | Record<string, string>; version?: string; installation?: string }[]; total: number; nextOffset: number | null } }
+  /** Opt in before assignment launch. Same binding is idempotent; busy, unavailable and worker-owned Sessions cannot be loaned. */
+  'POST tickets/:id/worker-session': { body: { sessionId: string }; response: { ticketId: string; sessionId: string; boundAt: string; unchanged: boolean } }
   'POST tickets/:id/retry': { response: { retried: true } }
   'POST tickets/:id/stop': { response: { stopped: true } }
   'POST executor/pause': { body: { paused: boolean }; response: { paused: boolean } }

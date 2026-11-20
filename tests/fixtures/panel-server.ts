@@ -37,7 +37,7 @@ export function actor(source: string, id: string, human = true): Actor {
 type TicketFields = Omit<TicketRow, 'stage' | 'action'>
 const TICKET = {
   id: 't1', title: '修复回归', state: 'open', actions: { retry: false, stop: true }, strength: 'explicit', ended: undefined,
-  attention: undefined, assignments: 1, inputs: 2, undelivered: 0, deliveryError: undefined, sessionId: 'worker-t1', directory: '/w/t1',
+  attention: undefined, assignments: 1, inputs: 2, undelivered: 0, deliveryError: undefined, sessionId: 'worker-t1', borrowedSessionId: undefined, directory: '/w/t1',
   summary: 'working on it', createdAt: '2026-09-22T00:00:00Z', updatedAt: '2026-09-23T00:00:00Z',
   threads: [{ key: 'github:42', source: 'github', title: '#42 Fix login', url: 'https://github.com/acme/widgets/pull/42',
     facts: { number: { value: '#42' }, ci: { label: { zh: 'CI 失败', en: 'CI failed' }, value: '1', problem: true } } }],
@@ -89,6 +89,11 @@ export interface PanelServer {
   joinError?: string
   settings: Settings; revisions: Record<string, number>
   prompts: PromptsView
+  workerSessions: ApiResponse<'GET dsh-sessions'>['items']
+  pluginIndexes: ApiResponse<'GET plugin-indexes'>
+  pluginResults: ApiResponse<'GET plugin-search'>
+  routerChat: ApiResponse<'GET router-chat'>
+  routerSessions: ApiResponse<'GET router-sessions'>
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
@@ -256,6 +261,10 @@ function initial(): PanelServer {
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
       defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], notificationPending: false, next_offset: null },
+    workerSessions: [], pluginIndexes: { available: false, items: [] },
+    pluginResults: { entries: [], total: 0, nextOffset: null },
+    routerChat: { sessionId: 'master', items: [] as { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] },
+    routerSessions: { masterId: 'master', items: [] },
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
@@ -327,6 +336,26 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET tickets': { query: ['state', 'offset', 'limit'], answer: ({ query }) => page(server.tickets[query.state === 'ended' ? 'ended'
     : 'open']) },
   'GET tickets/:id': { answer: ({ params }) => server.ticketDetails[params.id] ?? refuse(404, 'Ticket not found') },
+  'GET dsh-sessions': { answer: () => ({ items: server.workerSessions }) },
+  'GET router-chat': { query: ['limit'], answer: () => server.routerChat },
+  'GET router-events': { answer: () => ({ counts: [{ type: 'user/message', count: 1 }] }) },
+  'GET router-sessions': { answer: () => server.routerSessions },
+  'GET router-event-sample': { query: ['type'], answer: () => ({ found: null }) },
+  'POST router-chat': { body: true, answer: ({ body }) => {
+    const text = (body as { text: string }).text
+    server.routerChat = { ...server.routerChat, items: [...server.routerChat.items, { role: 'user', text, dispatched: [] }] }
+    return { sent: true as const }
+  } },
+  'GET plugin-indexes': { answer: () => server.pluginIndexes },
+  'GET plugin-search': { query: ['url', 'text'], answer: () => server.pluginResults },
+  'POST tickets/:id/worker-session': { body: true, answer: ({ params, body }) => {
+    const boundAt = new Date().toISOString()
+    const detail = server.ticketDetails[params.id]
+    if (detail) server.ticketDetails[params.id] = { ...detail, borrowedSessionId: body.sessionId }
+    server.workerSessions = server.workerSessions.map(session => session.sessionId === body.sessionId
+      ? { ...session, borrowable: false, leasedToTicketId: params.id } : session)
+    return { ticketId: params.id, sessionId: body.sessionId, boundAt, unchanged: false }
+  } },
   'POST tickets/:id/retry': { answer: ({ params }) => {
     const ticket = ticketOf(params.id)
     if (!ticket) return refuse(404, 'Ticket not found')

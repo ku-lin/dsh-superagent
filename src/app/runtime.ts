@@ -2,6 +2,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
@@ -11,8 +12,10 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
+import { sameDirectory } from '../infra/environment.ts'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
@@ -30,6 +33,7 @@ import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
+import { selectRouterSessions } from './router-sessions.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -50,6 +54,18 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+/** Resolves a DSH session read within a couple of seconds, or fails loudly instead of leaving the panel loading forever. */
+async function bounded<T>(read: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not answer in time; retry once the running turn ends`)), 3000)
+  })
+  try { return await Promise.race([read, timeout]) } finally { clearTimeout(timer) }
+}
+/** The router Session's first message: it makes the conversation visible in the workspace without waking the model. */
+const ROUTER_GREETING = '这是 dsh-superagent 的常驻 Router 对话。直接说「列出所有 worker」看它在指挥哪些对话，或说「让 <对话标题> 去做 <事情>」把指令发给某个 worker。'
+/** Its sidebar title: fixed, so the permanent conversation is recognizable and does not take a title from its first message. */
+const ROUTER_TITLE = 'Router（常驻）'
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -73,7 +89,7 @@ export class Runtime extends Service implements SourceHost {
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
-  readonly masterId: string
+  masterId: string
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
   private readonly disposers: (() => void)[] = []
@@ -101,7 +117,11 @@ export class Runtime extends Service implements SourceHost {
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
-      const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
+      // The router's own conversation must be a DSH-catalogued Session, or the workspace cannot open it: `session-<uuid>`.
+      // An installation from before this rule keeps its stored id only when it already has that form; otherwise it gets a new one.
+      const stored = store.get(KV.runtime.masterId)
+      const catalogued = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      const masterId = this.masterId = stored && catalogued.test(stored) ? stored : `session-${randomUUID()}`
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
@@ -146,6 +166,7 @@ export class Runtime extends Service implements SourceHost {
           if (followup) sessions.relay(followup.id, followup.text)
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
+          if (ended) store.afterCommit(() => sessions.releaseTicket(ended.id))
           if (ended && setup.configured()) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
@@ -157,11 +178,17 @@ export class Runtime extends Service implements SourceHost {
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
-        get deployment() { return setup.deployment }, configured: () => setup.configured(),
+      get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
+        titleOf: async (sessionId: string) => {
+          // The title is committed as a `session/title` event; the list projection may leave it out, so read the history.
+          type Titled = { type?: string; data?: { title?: string } }
+          const events = (await runtime.ctx.sessionController.inspect(sessionId as SessionId)).events as readonly Titled[]
+          return events.filter(event => event.type === 'session/title').at(-1)?.data?.title ?? ''
+        },
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()
     } catch (error) {
@@ -198,16 +225,53 @@ export class Runtime extends Service implements SourceHost {
   private closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  /**
+   * Makes the Router's own conversation openable from the panel: it must belong to a Workspace the client knows (the
+   * process working directory, not the plugin's state directory), and a Session with no message is hidden from the list,
+   * so it gets one opening message, injected without waking the model.
+   */
+  private async ensureRouterSession(): Promise<void> {
+    try {
+      // The conversation must live in a Workspace the client already shows, or opening it reports the Session as unusable:
+      // `sessions.ensure` creates it in that Workspace instead of one made from the plugin's own directory.
+      const workspace = await this.defaultWorkspaceId()
+      await this.sessions.ensure(this.masterId, process.cwd(), ROUTER_TITLE, 'orchestrator', workspace?.id)
+      if (this.store.get(KV.runtime.greeted) !== this.masterId) {
+        // Queued, not injected: a Session whose only message waits for a turn is still a draft the client cannot open, and
+        // this one message is what turns the conversation into a real, listed Session with its own hello.
+        await this.sessions.prompt(this.masterId, key('router-greeting'), ROUTER_GREETING, 'queue')
+        this.store.set(KV.runtime.greeted, this.masterId)
+      }
+      // Renamed last, so the explicit title is the newest title event: it names the conversation in the sidebar and pins it
+      // against the automatic title its first message would otherwise give it.
+      const renamed = await this.ctx.sessionController.rename({ sessionId: this.masterId as SessionId, title: ROUTER_TITLE })
+      if ('error' in renamed) this.ctx.logger.warn('dsh-superagent could not title its router conversation: %s', String(renamed.error))
+    } catch (error) { this.ctx.logger.warn('dsh-superagent could not prepare its router conversation: %s', String(error)) }
+  }
+  /**
+   * The directory of the Workspace the client actually shows as the default. `initializeDefault` is the host's own answer to
+   * that question; the list order is not, because a Workspace created for some other Session can come first.
+   */
+  private async defaultWorkspaceId(): Promise<{ id: string; path?: string } | undefined> {
+    try {
+      const preferred = await this.ctx.workspaceRegistry.initializeDefault(async () => process.cwd()).catch(() => undefined)
+      if (preferred) return preferred
+      const listed = [...await this.ctx.workspaceRegistry.list()]
+      return listed.find(item => item.path?.toLowerCase() === process.cwd().toLowerCase()) ?? listed[0]
+    } catch { return undefined }
+  }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
+      // The Router conversation is the panel's way in, so it exists even while setup blocks dispatch.
+      await this.ensureRouterSession()
       return
     }
     this.sessions.install()
     this.executor.install()
-    await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    await this.ensureRouterSession()
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -220,6 +284,83 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+      // DSH's session calls queue behind a running turn; a bounded read keeps the panel from showing an endless spinner.
+      listDshSessions: async () => bounded(this.ctx.sessionController.list({}, new AbortController().signal).then(listed => listed.items), 'the DSH session list'),
+      /** The router conversation's last exchanges, so the panel can show it as the permanent chat it is. */
+      routerChat: async (limit: number) => {
+        // DSH puts a message's blocks at `data.content`; an assistant reply may also arrive under `data.message`.
+        type Blocks = readonly { type?: string; text?: string }[]
+        type Shown = { type?: string; data?: { content?: Blocks; message?: { content?: Blocks }; name?: string; arguments?: string } }
+        const [events, listed] = await Promise.all([
+          bounded(runtime.ctx.sessionController.inspect(runtime.masterId as SessionId).then(found => found.events as readonly Shown[]), 'the router transcript'),
+          bounded(runtime.ctx.sessionController.list({}, new AbortController().signal).then(found => found.items), 'the DSH session list'),
+        ])
+        const textOf = (blocks: Blocks | undefined): string =>
+          (blocks ?? []).filter(block => block.type === 'text').map(block => block.text ?? '').join('\n').trim()
+        // A worker dispatch is a `orchestrator_worker_message` tool call; it is shown under the reply that requested it.
+        const titles = new Map<string, string>()
+        for (const session of listed) {
+          const titled = session as typeof session & { title?: string; projectionValues?: { title?: string } }
+          const title = titled.title ?? titled.projectionValues?.title
+          if (title) titles.set(session.sessionId, title)
+        }
+        const items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] = []
+        // Injected background notices (time context, runtime reminders) are not things the person said.
+        const injected = (event: Shown): boolean => {
+          const source = (event.data as { source?: { kind?: string } } | undefined)?.source
+          return source?.kind !== undefined && source.kind !== 'user'
+        }
+        for (const event of events) {
+          if (event.type === 'user/message' || event.type === 'assistant/message') {
+            if (event.type === 'user/message' && injected(event)) continue
+            const text = textOf(event.data?.content) || textOf(event.data?.message?.content)
+            if (text) items.push({ role: event.type === 'user/message' ? 'user' : 'assistant', text, dispatched: [] })
+            continue
+          }
+          if (event.type !== 'tool/call' || event.data?.name !== 'orchestrator_worker_message') continue
+          const target = items.findLast(item => item.role === 'assistant')
+          if (!target) continue
+          try {
+            const args = JSON.parse(event.data.arguments ?? '{}') as { session?: string }
+            const title = args.session ? titles.get(args.session) ?? '' : ''
+            if (title && !target.dispatched.includes(title)) target.dispatched.push(title)
+          } catch { /* A malformed argument list shows no dispatch; the reply still renders. */ }
+        }
+        return { sessionId: runtime.masterId, items: items.slice(-limit) }
+      },
+      /**
+       * The virtual Router workspace's rows. Durable Session headers decide membership: the `agentPreset` projection
+       * reads `standard` for the shipped 常驻 conversation although its header says `dsh-superagent-router`. The host
+       * list supplies only titles and recency, so a slow list degrades the rows instead of failing the whole group.
+       */
+      routerSessions: async () => {
+        const stored = await bounded(runtime.ctx.sessionPersistence.list(), 'the stored Session headers')
+        const listed = await bounded(runtime.ctx.sessionController.list({}, new AbortController().signal)
+          .then(found => found.items), 'the DSH session list').catch(() => [])
+        return { masterId: runtime.masterId,
+          items: selectRouterSessions(stored.map(snapshot => snapshot.header), listed, runtime.masterId) }
+      },
+      /** Delivery shapes of the router transcript, so the panel and its tests can rely on the fields DSH really emits. */
+      routerEventTypes: async () => {
+        const events = (await runtime.ctx.sessionController.inspect(runtime.masterId as SessionId)).events as readonly { type?: string; data?: unknown }[]
+        const counts = new Map<string, number>()
+        for (const event of events) counts.set(event.type ?? '?', (counts.get(event.type ?? '?') ?? 0) + 1)
+        return { counts: [...counts].map(([type, count]) => ({ type, count })) }
+      },
+      /** One transcript event of a kind, verbatim, for aligning the chat view with the host's real payloads. */
+      routerEventSample: async (type: string) => {
+        const events = (await runtime.ctx.sessionController.inspect(runtime.masterId as SessionId)).events as readonly { type?: string; data?: unknown }[]
+        const found = events.find(event => event.type === type)
+        return { found: found ? JSON.stringify(found).slice(0, 1200) : null }
+      },
+      /** Delivers one message into the router conversation; its reply arrives as the conversation runs. */
+      routerSend: async text => {
+        await runtime.sessions.prompt(runtime.masterId, key('router-chat', String(Date.now()), text), text, 'queue')
+        return { sent: true as const }
+      },
+      // `get` returns undefined when no Plugin Market is mounted; a property access would throw without an injection.
+      get pluginMarket() { return runtime.ctx.get('pluginMarket') as HttpHost['pluginMarket'] | undefined },
+      sourceless: () => setup.sourceless,
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),

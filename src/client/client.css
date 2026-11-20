@@ -380,3 +380,42 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-admission-slot { display: inline-flex; flex: none; width: 16px; }
 .dt-info-warn { color: var(--dsw-alias-state-warn-primary); }
 .dt-field-segmented { max-width: 240px; }
+.dt-worker-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.dt-worker-picker { display: flex; flex-direction: column; gap: 4px; flex: 1 1 240px; max-width: 420px; min-width: 0; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.dt-worker-discovery { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dt-worker-discovery .dt-row-title { overflow-wrap: anywhere; }
+
+/* === Router view ===
+   Only tokens this theme actually defines are used: --dsw-alias-bg-layer-*, --dsw-alias-border-l*, --dsw-alias-label-*,
+   --dsw-alias-button-primary-fill. A made-up token with a dark fallback is what made this panel a black block on a light page. */
+.dt-worker-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 300px); gap: 20px; align-items: start; }
+.dt-worker-main { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.dt-worker-rail { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding-left: 16px;
+  border-left: 1px solid var(--dsw-alias-border-l2); }
+.dt-worker-rail-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.dt-worker-rail-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.dt-worker-rail-title { flex: 1 1 120px; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dt-worker-status { flex: 0 0 auto; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 18px;
+  border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); }
+.dt-worker-status-running { border-color: var(--dsw-alias-state-success-primary, var(--dsw-alias-border-l3)); }
+.dt-worker-status-borrowed { border-color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-border-l3)); }
+.dt-worker-status-unavailable { color: var(--dsw-alias-label-caption); }
+
+/* The console card: the same surface the panel's other cards use, so it reads correctly on light and dark themes. */
+.dt-router-chat { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 14px 16px; border-radius: 16px;
+  background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); }
+.dt-router-chat .dt-router-open { height: 40px; padding: 0 18px; border-radius: 20px; font-size: 14px; font-weight: 600;
+  background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.16); }
+.dt-router-chat .dt-router-open:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover, var(--dsw-alias-button-primary-fill)); }
+.dt-router-chat .dt-router-open .dt-btn-icon { display: inline-flex; }
+.dt-router-hint { margin: 0; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); }
+.dt-router-last { margin: 0; padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 18px;
+  color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-2); overflow-wrap: anywhere; }
+.dt-worker-more { border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; padding: 8px 12px; background: var(--dsw-alias-bg-layer-1); }
+.dt-worker-more > summary { cursor: pointer; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.dt-worker-more[open] > summary { margin-bottom: 8px; }
+@media (max-width: 900px) {
+  .dt-worker-layout { grid-template-columns: minmax(0, 1fr); }
+  .dt-worker-rail { padding-left: 0; border-left: 0; border-top: 1px solid var(--dsw-alias-border-l2); padding-top: 8px; }
+}

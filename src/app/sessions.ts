@@ -18,6 +18,7 @@ import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
+import { ROUTER_PRESET, WORKER_PRESET } from './router-sessions.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
 
 /** Host dependencies used by `Sessions`. */
@@ -45,7 +46,7 @@ export interface SessionsHost {
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
-export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+export { ROUTER_PRESET, WORKER_PRESET }
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -60,8 +61,15 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/**
+ * Tools the router conversation keeps. It routes; it does not work. No shell, no job control, no writes: the only way it can
+ * change anything is through its own `orchestrator_*` tools, which act on Tickets and other conversations. `read` stays for
+ * reading a card or a resource it must judge, and the list is filtered by what the profile provides, because naming a tool the
+ * profile lacks makes `restrict` throw and the Session cannot resume at all.
+ */
+const ROUTER_TOOLS = ['skill', 'read', 'read_image']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
-const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
+const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with their output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
 /** What a main Session under `standard` is told when its command would wait the shell's default. */
 const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
@@ -94,6 +102,8 @@ export class Sessions {
   private readonly agentDelivery: AgentDelivery
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
+  /** Ticket tools added to an explicitly borrowed conversation without changing its existing prompt or tools. */
+  private readonly borrowed = new Map<Agent, { ticketId: string; disposers: (() => void)[]; abort: AbortController }>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
@@ -108,6 +118,7 @@ export class Sessions {
   install(): void {
     const ctx = this.ctx
     ctx.on('agent/disposed', ({ agent }) => {
+      this.releaseBorrowed(agent)
       this.release(agent)
       this.retryHealth.clear(agent.id); this.updateModelHealth()
     })
@@ -135,13 +146,19 @@ export class Sessions {
     })
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  /**
+   * Ensures a Session exists.
+   * @param cwd - its directory; the `workspaceId` overrides which Workspace it joins, so the router conversation can join the
+   * one the client already opens instead of making another Workspace for the same directory.
+   */
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker',
+    workspaceId?: string): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
-      const workspace = await ctx.workspaceRegistry.create(cwd)
+      const workspace = workspaceId ? { id: workspaceId } : await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
+      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id as never,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
@@ -152,6 +169,45 @@ export class Sessions {
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /** Add only ticket-scoped tools to a borrowed conversation; preserve its existing preset, prompts, and tools. */
+  async borrow(agent: Agent, ticket: Ticket): Promise<void> {
+    if (this.host.store.tickets.open().some(current => current.id !== ticket.id
+      && current.execution?.borrowedSession?.sessionId === agent.id))
+      throw new Error('DSH Session already has another open borrowed ticket')
+    const existing = this.borrowed.get(agent)
+    if (existing?.ticketId === ticket.id) return
+    if (existing) {
+      const previous = this.host.store.tickets.get(existing.ticketId)
+      if (previous && liveTicket(previous)) throw new Error('DSH Session already has a borrowed ticket')
+      this.releaseBorrowed(agent)
+    }
+    const binding: SessionBinding = { disposers: [] }
+    const abort = new AbortController()
+    this.borrowed.set(agent, { ticketId: ticket.id, disposers: binding.disposers, abort })
+    try {
+      const register = this.registerTool(agent, binding)
+      for (const tool of this.host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, (args, signal) => {
+        const current = this.host.store.tickets.get(ticket.id)
+        if (abort.signal.aborted || !current || !liveTicket(current) || current.execution?.borrowedSession?.sessionId !== agent.id)
+          throw new Error('Borrowed ticket ended or is no longer bound to this Session')
+        return tool.execute(args, AbortSignal.any([signal, abort.signal]))
+      })
+    } catch (error) {
+      this.releaseBorrowed(agent)
+      throw error
+    }
+  }
+  /** Remove ticket tools when a loan ends without disposing the person's conversation. */
+  releaseTicket(ticketId: string): void {
+    for (const [agent, loan] of this.borrowed) if (loan.ticketId === ticketId) this.releaseBorrowed(agent)
+  }
+  private releaseBorrowed(agent: Agent): void {
+    const loan = this.borrowed.get(agent)
+    if (!loan) return
+    this.borrowed.delete(agent)
+    loan.abort.abort(new Error('Borrowed ticket ended'))
+    for (const dispose of loan.disposers.reverse()) dispose()
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -260,7 +316,11 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+      // Only tools this host actually has: a hard-coded list naming a tool the profile lacks (such as `bash` on Windows)
+      // makes `restrict` throw, and the Session then cannot resume at all.
+      const parent = scopeParentOf(agent)
+      const keep = ROUTER_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: keep }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
@@ -348,5 +408,8 @@ export class Sessions {
     }
   }
   /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
-  dispose(): void { for (const agent of [...this.bindings.keys()]) this.release(agent) }
+  dispose(): void {
+    for (const agent of [...this.borrowed.keys()]) this.releaseBorrowed(agent)
+    for (const agent of [...this.bindings.keys()]) this.release(agent)
+  }
 }

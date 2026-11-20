@@ -34,7 +34,12 @@ async function api<T>(messages: ApiMessages, path: string, method: string, body?
   let response: Response
   const json = body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
   try {
-    response = await fetch(`/orchestrator/api/${path}`, { method, ...json, headers: { 'x-orchestrator-request': '1', ...json.headers } })
+    // A tab left open across a server restart can have its requests hang rather than fail; bounding them turns that into
+    // the "reload the page" message instead of a panel that says "loading" forever.
+    // The fence is the header below, not the session cookie; a cookie-bearing request is held by the host's own gateway,
+    // so this call deliberately omits credentials (verified: same URL answers 200 without them and hangs with them).
+    response = await fetch(`/orchestrator/api/${path}`, { method, ...json, signal: AbortSignal.timeout(8000), credentials: 'omit',
+      headers: { 'x-orchestrator-request': '1', ...json.headers } })
   } catch {
     throw new ApiError(messages.offline, 0, { unreachable: true })
   }

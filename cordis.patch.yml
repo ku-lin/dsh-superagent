@@ -127,7 +127,7 @@
       config:
         id: dsh-superagent-router
         name: dsh-superagent 主 Session
-        description: dsh-superagent 的主 Session 专用，不供手动选择。前台命令和任务等待超 5 秒转入后台，只含路由所需的工具。
+        description: dsh-superagent 的主 Session 专用，不供手动选择。只做调度：没有 shell、没有后台任务、不写文件，只能通过 orchestrator_* 工具派单。
         order: 91
         plugins:
           - id: agent-instructions
@@ -136,40 +136,13 @@
               maxBytes: 65536
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
-          - id: shell
-            name: cordis:group
-            group: true
-            isolate:
-              shell: true
-            config:
-              - id: bash-sandbox
-                name: '@deepseek-ai/dsh-bash-sandbox'
-                disabled: !!js process.platform === 'win32'
-                config:
-                  timeoutMs: 5000
-                  maxTimeoutMs: 5000
-              - id: pwsh-sandbox
-                name: '@deepseek-ai/dsh-pwsh-sandbox'
-                disabled: !!js process.platform !== 'win32'
-                config:
-                  timeoutMs: 5000
-                  maxTimeoutMs: 5000
-              - id: tool-bash
-                name: '@deepseek-ai/dsh-tool-bash'
-                disabled: !!js process.platform === 'win32'
-              - id: tool-pwsh
-                name: '@deepseek-ai/dsh-tool-pwsh'
-                disabled: !!js process.platform !== 'win32'
+          # No shell group and no job tools: the router routes, it does not run commands. A shell here is what let it work
+          # directly instead of dispatching, which contradicts the role its prompt states.
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
               write: false
               edit: false
-          - id: tool-jobs
-            name: '@deepseek-ai/dsh-tool-jobs'
-            config:
-              waitTimeoutMs: 5000
-              maxWaitTimeoutMs: 5000
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
           - id: tool-skill

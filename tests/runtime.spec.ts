@@ -557,6 +557,8 @@ it('projects read models for the management page and removes thread subscription
   expect((await api('GET', 'state')).body).not.toHaveProperty('tickets')
   // scripts/dsh-superagent and agents read health from GET state (docs/006, Management API); settings and their revisions have their own route.
   expect((await api('GET', 'state')).body).toMatchObject({ health: { runtime: { state: expect.any(String) } }, paused: false, load: { maxWorkers: 3 } })
+  // No Plugin Market is mounted here, so discovery reports itself unavailable instead of failing the route.
+  expect((await api('GET', 'plugin-indexes')).body).toEqual({ available: false, items: [] })
   expect((await api('GET', 'settings')).body).toMatchObject({ sources: expect.arrayContaining([expect.objectContaining({ id: 'github',
     revision: expect.any(Number), value: expect.objectContaining({ enabled: true }) })]), blocks: { policy: { revision: expect.any(Number) } } })
   expect((await api('POST', `threads/${encodeURIComponent(threadKeyValue)}/unsubscribe`)).body).toMatchObject({ removed: true })
@@ -1560,7 +1562,8 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
+  // The router keeps only tools this profile actually provides, and only management ones: no shell, no job control.
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'read', 'read_image'] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
