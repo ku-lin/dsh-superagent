@@ -1,6 +1,6 @@
 # 005 Panel
 
-Open **Superagent** in the DeepSeek Harness Web sidebar to supervise the agent. The panel prioritizes work that needs a person, then system health and history. This document builds on [000 Philosophy](000-philosophy.md) through [004 Prompts](004-prompts.md).
+Open **Settings › Superagent › Open management console** in DeepSeek Harness Web to supervise the agent. The Settings section also keeps the Router group locator and duplicate-row visibility switch; the virtual Router group stays at the bottom of the workspace list. The panel prioritizes work that needs a person, then system health and history. This document builds on [000 Philosophy](000-philosophy.md) through [004 Prompts](004-prompts.md).
 
 ## Three questions
 

@@ -9,6 +9,13 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [1.2.5] - 2026-11-21
+
+### Changed
+
+- Move Superagent management access into Settings › Superagent. The section opens the existing management console and keeps the Router group locator, duplicate-row visibility switch and router conversation list.
+- Remove the Router workspace rail entry and Router footer action. The virtual Router group remains at the bottom of the workspace list.
+
 ## [1.2.4] - 2026-11-21
 
 A display rule only: a worker conversation is no longer listed in the virtual Router workspace. It stays where it was

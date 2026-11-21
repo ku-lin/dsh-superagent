@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { ApiError, caller, usePoll } from '../src/client/api.ts'
 import { apply } from '../src/client/index.tsx'
+import { readSuppressNative } from '../src/client/router-workspace.ts'
 import { zh } from '../src/client/locales.ts'
 import { SettingsSchema } from '../src/policy.ts'
 
@@ -15,10 +16,12 @@ const t = ((key: keyof typeof zh) => zh[key] ?? key) as never
 function fixture(listed: string[]) {
   const entries: Entry[] = []
   const dictionaries: Record<string, unknown> = {}
+  const stops: (() => void)[] = []
   const ctx = {
     slots: { inject: (_name: string, register: () => void) => register(), register: (options: Entry['options'], component: Entry['component']) => { entries.push({ options, component }); return () => {} } },
     locale: { register: (ns: string, value: unknown) => { dictionaries[ns] = value; return () => {} }, bind: () => t },
-    effect: (effect: () => unknown) => { effect() },
+    effect: (effect: () => unknown) => { const stop = effect(); if (typeof stop === 'function') stops.push(stop as () => void) },
+    layout: { selectPanel: vi.fn() },
     sessions: { list: { getSnapshot: () => ({ phase: 'ready', byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
     uiWorkspace: { openSession: vi.fn() },
     // Omit config form service so Deployment renders read-only.
@@ -26,7 +29,7 @@ function fixture(listed: string[]) {
   }
   apply(ctx as never)
   const entry = (name: string) => entries.find(item => item.options.name === name)!
-  return { ctx, entries, dictionaries, main: entry('main'), nav: entry('sidebar.panellist') }
+  return { ctx, entries, dictionaries, main: entry('main'), settings: entry('settings.section'), dispose: () => { stops.forEach(stop => stop()) } }
 }
 async function render(entry: Entry, props: Record<string, unknown>) {
   const container = document.createElement('div'); document.body.append(container)
@@ -49,14 +52,39 @@ const serve = () => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
 }))
 afterEach(() => { vi.unstubAllGlobals() })
 
-it('registers a localized main panel, sidebar entry and Plugin Manager row page, and no settings section', () => {
-  const { entries, dictionaries, main, nav } = fixture([])
-  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'plugins.row.config'])
+it('registers Superagent in Settings, keeps the main console and removes Router rail and footer entries', () => {
+  const { entries, dictionaries, main, settings, dispose } = fixture([])
+  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'settings.section', 'plugins.row.config'])
   expect(entries[2]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
-  expect(nav.options).toMatchObject({ id: 'dsh-superagent', order: 10, locale: 'dshSuperagent' })
-  expect(nav.options.label?.()).toBe('Superagent')
+  expect(settings.options).toMatchObject({ id: 'dsh-superagent', order: 36, locale: 'dshSuperagent' })
+  expect(settings.options.label?.()).toBe('Superagent')
+  dispose()
+})
+
+it('keeps Settings controls and closes Settings before opening the management console or locating the group', async () => {
+  serve()
+  window.localStorage.clear()
+  const { ctx, settings, dispose } = fixture([])
+  const close = vi.fn()
+  const view = await render(settings, { t, close })
+  const checkbox = view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+  expect(checkbox.checked).toBe(true)
+  await act(async () => { checkbox.click() })
+  expect(readSuppressNative()).toBe(false)
+  await act(async () => { checkbox.click() })
+  expect(readSuppressNative()).toBe(true)
+  const consoleButton = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.superagentOpenConsole)!
+  await act(async () => { consoleButton.click() })
+  expect(close).toHaveBeenCalledOnce()
+  expect(ctx.layout.selectPanel).toHaveBeenCalledExactlyOnceWith('dsh-superagent')
+  expect(close.mock.invocationCallOrder[0]).toBeLessThan(ctx.layout.selectPanel.mock.invocationCallOrder[0]!)
+  const locate = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.routerWorkspaceEntry)!
+  await act(async () => { locate.click() })
+  expect(close).toHaveBeenCalledTimes(2)
+  view.dispose()
+  dispose()
 })
 
 it('opens a listed Session through the workspace from the main panel', async () => {
@@ -68,13 +96,12 @@ it('opens a listed Session through the workspace from the main panel', async () 
   view.dispose()
 })
 
-it('reports a Session missing from the catalog in the interface language', async () => {
+it('opens the Router Session directly when the catalog omits it', async () => {
   serve()
   const { ctx, main } = fixture([])
   const view = await render(main, { t })
   await openMaster(view.container)
-  expect(ctx.uiWorkspace.openSession).not.toHaveBeenCalled()
-  expect(document.body.textContent).toContain(zh.sessionNotListed)
+  expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
   view.dispose()
 })
 
