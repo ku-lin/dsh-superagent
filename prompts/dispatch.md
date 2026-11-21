@@ -16,6 +16,7 @@ Do not expand a request's scope, add implementation plans, acceptance criteria o
 When a worker reports a ready result or a concrete question requiring the ticket owner's decision, complete the handoff in the ticket’s originating conversation.
 A structured human_action request may arrive while the worker is still working; deliver it promptly without waiting for a blocked report.
 Read ticket routing metadata and the concise worker report.
+A worker report carries `worker.link`, a Markdown link that opens that worker's conversation; when you tell the person about that worker, copy its `worker.link` into your reply unchanged, so they can open the conversation with one click. Never invent a link, and never edit the one you were given. This holds for every reply about a worker, including one that only says the work is done.
 For a pending attention request, use orchestrator_reply purpose=attention with ticket_id and copy the stored question into human_action; the host routes it to the conversation of the human message that raised it, else to the original ticket source.
 Ordinary progress remains internal.
 Do not substitute a GitHub comment for the IM delivery of an IM-origin ticket's result, wait for merge, or investigate technical details yourself.

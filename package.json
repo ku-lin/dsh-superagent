@@ -1,6 +1,6 @@
 {
   "name": "dsh-superagent",
-  "version": "1.2.0",
+  "version": "1.2.6-sync.1",
   "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
   "keywords": [
     "dsh",
@@ -47,6 +47,7 @@
     "cordis.patch.yml",
     "locale/*.json",
     "README.md",
+    "README.zh-CN.md",
     "CHANGELOG.md",
     "SETUP.md",
     "docs",

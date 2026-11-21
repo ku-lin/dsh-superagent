@@ -46,6 +46,13 @@ export class Setup {
    * so the plugin starts instead of demanding a GitHub repository.
    */
   sourceless = false
+  /**
+   * True when setup finished well enough to execute Tickets: a Deployment resolved, or no Source is configured at all.
+   * A sourceless deployment has nothing to poll for, so it needs no repository or account, and a person can still hand it a
+   * Ticket; `configured()` stays false there, so no Source reads an account it does not have, and a Deployment that failed
+   * to resolve (a missing required setting, an unusable CLI) is not `ready` either.
+   */
+  ready(): boolean { return this.resolved !== undefined || this.sourceless }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
     const enabled = (source: string) => settings.sources[source]?.enabled !== false && !!settings.sources[source]

@@ -1,6 +1,8 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
 import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { DeleteReport, RouterSwitch } from './control.ts'
 import type { PromptConfig, Prompts } from './prompts.ts'
+import type { RouterSessionRow } from './router-sessions.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
@@ -34,9 +36,23 @@ export interface Api {
   'GET tickets/:id': { response: TicketPageView }
   /** Read-only DSH catalog. `title` is the conversation title the host projects; leasedToTicketId marks the exclusive lease reserved by a ticket (including one that can reopen). */
   'GET dsh-sessions': { response: { items: (SessionSummary & { title?: string; leasedToTicketId?: string; ticketTitle?: string; borrowable: boolean })[] } }
-  /** The permanent router conversation: its last exchanges, and the route that speaks into it. */
+  /**
+   * Router-level Sessions only: every stored Session whose header ran the router preset, plus its direct children, and
+   * the permanent conversation's id. This is the virtual Router workspace's whole data source, so it selects on the
+   * durable header rather than the `agentPreset` projection (which reads `standard` for a Session created before the
+   * preset registry composed it).
+   */
+  'GET router-sessions': { response: { masterId: string; items: RouterSessionRow[] } }
+  /** The permanent router conversation: its last exchanges, and the route that speaks into it. `queued` marks a message a
+   * stopped Router holds instead of delivering. */
   'GET router-chat': { query?: { limit?: number }; response: { sessionId: string; items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] } }
-  'POST router-chat': { body: { text: string }; response: { sent: true } }
+  'POST router-chat': { body: { text: string }; response: { sent: true; queued?: true } }
+  /** Stop the Router: its conversation keeps its history, and further messages wait in the queue. Tickets keep running. */
+  'POST router/stop': { body: { reason?: string }; response: RouterSwitch }
+  /** Start the Router again: the held messages are handed over in arrival order. */
+  'POST router/start': { response: RouterSwitch }
+  /** Delete one worker or router-level conversation; the permanent Router conversation and other people's are refused. */
+  'DELETE sessions/:id': { query?: { confirm?: string }; response: DeleteReport }
   'GET router-events': { response: { counts: { type: string; count: number }[] } }
   'GET router-event-sample': { query?: { type?: string }; response: { found: string | null } }
   /** Read-only list of configured plugin market sources; no network fetch. */

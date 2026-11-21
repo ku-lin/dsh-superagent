@@ -1,6 +1,6 @@
 # dsh-superagent
 
-**Version 1.2.0** · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
+**Version 1.2.6-sync.1** · **English** · [中文](README.zh-CN.md) · [CHANGELOG](CHANGELOG.md) · [MIT](LICENSE) · [Contributing](CONTRIBUTING.md)
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
@@ -101,7 +101,7 @@ Two layers, and they are deliberately separate.
 | `source:github` | `repository` (`owner/name`), `cli`, and the observe switches `observeIssues`, `observePulls`, `observeComments`, `observeCi` (all off by default) |
 | `source:feishu` | `cli`, `chats` (`chatId`, `name`, `listen` = `mentions` or `all`), `directMessages`, `otherChats` |
 | `policy` | `rules`, and per Source the `allowed` list, `bots`, and per-chat/per-channel `admission` defaults |
-| `executor` | `model`, `maxWorkers`, `directory`, `prepare`, `blockedCommands` |
+| `executor` | `model`, `maxWorkers`, `workspace`, `directory`, `prepare`, `blockedCommands` |
 | `eval` | `mode`, `timeoutSeconds`, `model` |
 | prompts | team sections: GitHub disclosure line, review bots, commit author, auto-merge condition |
 
@@ -134,6 +134,9 @@ Because `engines.dsh` names a prerelease, DSH's compatibility gate rejects newer
 Honest list — several of these are the difference between "runs" and "supported".
 
 - **Research prototype.** Not production-ready, not an official DeepSeek product, and reviewed by nobody outside its authors. Expect bugs.
+- **A worker's shell starts at its Workspace root.** The worker Session names only a Workspace, so DSH gives it `workspace.path` as the working directory: a command runs at the root of the directory the ticket works in, not inside the ticket's own directory. The ticket directory still holds what the Executor prepared (worktree, logs, evidence).
+- **A worker runs with `danger-full-access`: there is no filesystem fence.** The permission preset grants the worker's tools the whole machine, the same as a person's own session; nothing stops it from reading or writing outside its Workspace. Run the harness on a machine and account you are willing to expose.
+- **One worker per Workspace at a time.** A ticket aimed at a Workspace that already has a running worker waits for it (re-checked every five seconds); tickets in different Workspaces run in parallel, up to `executor.maxWorkers`.
 - **`scripts/dsh-superagent` is POSIX-only.** It imports `fcntl` and shells out to `ps`/`tmux`. On Windows use it under WSL, or start the profile yourself and skip the script's log and control handling.
 - **Not on npm.** Install is from source and needs a build step; there is no versioned artifact on the registry yet.
 - **Exact peer versions.** The `@deepseek-ai/*` peer dependencies are pinned to the `0.2.1-alpha.2` line (`@deepseek-ai/cordis` to `4.0.5-alpha.1`, `@deepseek-ai/schemastery` to `3.18.5-alpha.1`). A newer DSH may refuse the bundle.

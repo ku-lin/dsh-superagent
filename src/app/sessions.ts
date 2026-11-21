@@ -4,7 +4,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
+import { realpath } from 'node:fs/promises'
+import { dirname, normalize, resolve as resolvePath, sep } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
@@ -18,7 +19,65 @@ import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
+import { ROUTER_PRESET, WORKER_PRESET } from './router-sessions.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+
+/**
+ * A directory in the form a Workspace stores: absolute, resolved through symlinks when it exists, and spelled the way
+ * the filesystem reports it. A missing directory keeps its absolute spelling; the registry reports that case itself.
+ */
+async function canonicalPath(directory: string): Promise<string> {
+  const absolute = resolvePath(directory)
+  return await realpath(absolute).catch(() => absolute)
+}
+
+/** One directory spelling to compare: separator-normalized, trailing separators dropped, lowercased on Windows. */
+function canonicalSpelling(value: string): string {
+  const normalized = normalize(value).replace(/[\\/]+$/, '')
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+/** Whether two directory spellings name the same place. */
+export function samePath(left: string, right: string): boolean {
+  return canonicalSpelling(left) === canonicalSpelling(right)
+}
+
+/**
+ * How deep `ancestor` sits above `target`: its spelling length, or `-1` when it is not a parent directory.
+ *
+ * The comparison is on whole path segments, so a Workspace at `/share` never claims a ticket in `/share2`, and the
+ * length is what makes the deepest registered parent win when several of them contain the directory.
+ */
+export function ancestorDepth(ancestor: string, target: string): number {
+  const parent = canonicalSpelling(ancestor)
+  const child = canonicalSpelling(target)
+  if (parent === '' || parent === child) return -1
+  const boundary = parent.endsWith(sep) ? parent : parent + sep
+  return child.startsWith(boundary) ? parent.length : -1
+}
+
+/**
+ * The Workspace a ticket's directory belongs in: the exact one when it is registered, otherwise the deepest registered
+ * parent of that directory, otherwise nothing (the caller registers it).
+ *
+ * A worker lands where a person would land by opening the directory and starting a conversation: at the repository
+ * root's Workspace, not a new Workspace per worktree, and not a broad parent such as `/share` when a deeper one exists.
+ * @param listed - the registered Workspaces, whose `path` may be absent for a record the host did not describe.
+ * @param directory - the ticket's target directory, already resolved by the caller.
+ * @returns the Workspace to join, or undefined when no registered Workspace contains the directory.
+ */
+export function nearestWorkspace<T extends { readonly path?: string }>(listed: readonly T[], directory: string): T | undefined {
+  const exact = listed.find(item => item.path !== undefined && samePath(item.path, directory))
+  if (exact !== undefined) return exact
+  let nearest: T | undefined
+  let deepest = -1
+  for (const item of listed) {
+    if (item.path === undefined) continue
+    const depth = ancestorDepth(item.path, directory)
+    if (depth > deepest) { deepest = depth; nearest = item }
+  }
+  return nearest
+}
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -32,6 +91,8 @@ export interface SessionsHost {
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
+  /** Whether the Router conversation is stopped, which holds every message bound for it instead of dropping it. */
+  routerStopped(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
@@ -45,7 +106,7 @@ export interface SessionsHost {
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
-export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+export { ROUTER_PRESET, WORKER_PRESET }
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -110,8 +171,11 @@ export class Sessions {
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
-    // Deliver relays and notices to the main Session in the order they were queued.
-    host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
+    // Deliver relays and notices to the main Session in the order they were queued. A relay is held while the Router is
+    // stopped: steering would start the Router's turn, and a queued one would too, so both kinds wait in the durable queue
+    // instead — the row survives a restart, and a start hands it over in arrival order.
+    host.effects.handle('relay', ({ text, queue }, requestId) => this.prompt(host.masterId, requestId, text, queue ? 'queue' : 'steer'),
+      { ordered: true, limit: () => host.routerStopped() ? 0 : 1 })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
@@ -145,33 +209,102 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   /**
-   * Ensures a Session exists.
-   * @param cwd - its directory; the `workspaceId` overrides which Workspace it joins, so a person finds the conversation in
-   * the Workspace they have open instead of one made per ticket directory. The directory itself still comes from `cwd`.
+   * Ensures a Session exists in one Workspace, composed for its role.
+   *
+   * The Session is created with `workspaceId` **only**: DSH refuses a create that names both a Workspace and a `cwd`
+   * (`session.create accepts workspaceId or cwd, not both`), and the Workspace is what makes the conversation visible
+   * and resumable — DSH derives the Session's working directory from `workspace.path`, exactly as it does for a
+   * conversation a person starts by opening that directory.
+   * @param id - the Session to resolve or create.
+   * @param title - the title to set once composed.
+   * @param role - which preset composes it.
+   * @param workspaceId - the Workspace it joins; omitted only for a host with no Workspace at all.
    */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker',
-    workspaceId?: string): Promise<Agent> {
+  async ensure(id: string, title: string, role: 'orchestrator' | 'worker', workspaceId?: string): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
+    let created = false
     if ('error' in result && result.error.code === 'session/not-found') {
-      // A worker conversation belongs in the Workspace the client shows, like the router's: a person has to be able to open
-      // it. Only a host with no Workspace at all falls back to one made from the ticket directory.
-      const joining = workspaceId ?? (await this.defaultWorkspace())?.id
-      const workspace = joining ? { id: joining } : await ctx.workspaceRegistry.create(cwd)
-      // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id as never, cwd,
+      // A host with no Workspace at all still needs one: its own directory, the same Workspace opening it would make.
+      const joining = workspaceId ?? (await this.defaultWorkspace())?.id ?? (await this.workspaceFor(process.cwd())).id
+      // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml). No `cwd`: passing
+      // both is rejected, and the Workspace already decides the directory.
+      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: joining as never,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
+      created = true
     }
     if ('error' in result) throw result.error
+    // Named first: a Session without a `session/title` event is the 未命名 row the client lists, and the composition
+    // below (role model, prompt, skills, tools) can take as long as the host takes to load them.
+    if (created) await this.name(result.agent, title)
     const settings = this.host.store.settings()
     await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
-    await ctx.sessionController.rename({ sessionId: id as SessionId, title })
+    // Again last, and verified: DSH's title service pins an explicit title, but a host that lost the first attempt (or
+    // renamed the conversation while composing it) must not leave the row nameless.
+    await this.name(result.agent, title)
     return result.agent
+  }
+  /**
+   * Give a Session its title and confirm the host committed it.
+   *
+   * `session.create` takes no title, and a Session is listed as 未命名 until a `session/title` event lands, so this runs
+   * as soon as the Session exists and again after composing it. The attempt is verified against the title service's own
+   * fold (`sessionTitle`), and retried once: an unverified call used to fail silently and leave the conversation nameless
+   * in the sidebar and in the Router workspace group.
+   * @param agent - the resolved Session, whose `session` is the log the title is folded from.
+   * @param title - the name the conversation must carry.
+   */
+  private async name(agent: Agent, title: string): Promise<void> {
+    const committed = (): string | undefined => {
+      try {
+        const service = this.ctx.get('sessionTitle') as { get?: (session: Agent['session']) => { title?: string } | undefined } | undefined
+        const current = service?.get?.(agent.session)?.title
+        return typeof current === 'string' ? current : undefined
+      } catch { return undefined }
+    }
+    // The host keeps a title within its own byte budget, so a committed title is a prefix of what was asked for.
+    const applied = (value: string | undefined): boolean => value !== undefined && value !== '' && (value === title || title.startsWith(value))
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const renamed = await this.ctx.sessionController.rename({ sessionId: agent.id as SessionId, title }) as
+          { error?: unknown } | undefined
+        // Only a reported error or an unconfirmed title is a failure: a host that answers with nothing else has accepted it.
+        const error = renamed !== null && typeof renamed === 'object' && 'error' in renamed ? renamed.error : undefined
+        if (error === undefined && (committed() === undefined || applied(committed()))) return
+        if (attempt === 1) this.ctx.logger.warn('dsh-superagent could not title Session %s: %s', agent.id,
+          error === undefined ? `the host did not commit "${title}" (it lists "${committed() ?? ''}")` : JSON.stringify(error))
+      } catch (error) {
+        if (attempt === 1) this.ctx.logger.warn('dsh-superagent could not title Session %s: %s', agent.id, String(error))
+      }
+      await new Promise(resolve => setTimeout(resolve, 150))
+    }
+  }
+  /**
+   * The Workspace for a ticket's target directory: the one a person lands in by opening that directory, so a worker's
+   * conversation appears where its work does.
+   *
+   * The registered Workspaces are compared on their canonical form (resolved, separator-normalized, case-insensitive on
+   * Windows) because a Workspace keeps the `realpath` it was registered with. An exact match wins; otherwise the deepest
+   * registered parent wins, which puts a ticket under a repository root's Workspace instead of one per worktree; only a
+   * directory no Workspace contains is registered — the way opening it would register it.
+   * @param directory - the ticket's target directory.
+   * @returns the existing or newly registered Workspace.
+   */
+  async workspaceFor(directory: string): Promise<{ id: string; path?: string }> {
+    const wanted = await canonicalPath(directory)
+    // A host that cannot list its Workspaces still gets this directory registered, exactly as opening it would.
+    let listed: readonly { id: string; path?: string }[] = []
+    try { listed = [...await this.ctx.workspaceRegistry.list()] } catch { listed = [] }
+    return nearestWorkspace(listed, wanted) ?? await this.ctx.workspaceRegistry.create(wanted)
+  }
+  /** Ensures a worker Session inside the Workspace for `directory`, so the conversation sits where its work is. */
+  async ensureWorker(id: string, title: string, directory: string): Promise<Agent> {
+    const workspace = await this.workspaceFor(directory)
+    return this.ensure(id, title, 'worker', workspace.id)
   }
   /** Add only ticket-scoped tools to a borrowed conversation; preserve its existing preset, prompts, and tools. */
   async borrow(agent: Agent, ticket: Ticket): Promise<void> {
@@ -240,6 +373,16 @@ export class Sessions {
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
+  /**
+   * Enqueues one message for the Router conversation as an ordinary next turn.
+   *
+   * Every path that hands the Router something to read — a person typing in the panel, a worker's answer — goes through
+   * here, so a stopped Router queues work instead of being woken by it. The queue row is durable and deduplicated by
+   * `requestId`, exactly like the other effects; a start releases it in arrival order.
+   * @param requestId - idempotency key of this delivery.
+   * @param text - the message.
+   */
+  routerMessage(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text, queue: true }) }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
   /** Waits for currently runnable `notice` effects to settle and returns `'injected'` if notice `name` has reached the main Session or `'pending'` if it is still queued. */

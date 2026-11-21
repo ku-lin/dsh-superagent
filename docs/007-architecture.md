@@ -313,7 +313,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports |
-| `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
+| `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop: it takes the state directory's lock first, and a lock another process holds leaves it reporting `lockWait` with the management routes answering that wait |
+| `src/app/state-lock.ts` | The state directory's lock: `acquireStateLock` retries inside the stale window a killed predecessor leaves, `describeLock` reads the holder's last refresh, and `lockPath` names the lock directory |
 | `src/app/setup.ts` | Setup, and `setupChanged`, whether a save changes a field setup reads |
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
@@ -329,7 +330,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
-| `src/app/sessions.ts` | Sessions |
+| `src/app/sessions.ts` | Sessions, including `routerMessage`, the one path a message takes into the Router conversation |
+| `src/app/control.ts` | `Control`: the Router's stop/start switch (its own record, never the Executor's `paused`), the audit trail of panel and tool writes, and deletion of the conversations this plugin owns — a worker or router-level conversation only, never the permanent Router conversation — with `removeSessionLog` deciding what leaves disk and `encodeSegment` mirroring the persistence backend's path encoding |
+| `src/app/router-sessions.ts` | `selectRouterSessions`, the Router group's membership: a Session enters it only when its durable header ran `ROUTER_PRESET`, so a worker — whatever its preset, id prefix or projected title — stays in the Workspace it works in, and derived Sessions stay out; `sessionTitle` reads a title from the three projection seats, and `RouterSessionRow` is the row both the group and the Router page take |
+| `src/app/session-link.ts` | `sessionLink`, the `dsh://session/<id>` Markdown link that opens one conversation, with `SESSION_LINK_PREFIX`, the `#session=` hash spelling a sanitizer leaves intact, and `sessionIdOfHref`; pure text, so the bundle, the client and the tests share it |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -374,8 +378,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
-| `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
+| `src/client/index.tsx` | The client plugin entry: the Superagent Settings section, main console, virtual Router group and Plugin Manager page |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
+| `src/client/router-panel.tsx` | The Superagent Settings page: management-console entry, the Router stop/start switch with its reason field and last refusal, the Router group locator, duplicate-row visibility switch, and the router conversation list whose rows offer a delete button everywhere except on the permanent Router conversation |
+| `src/client/router-control.ts` | The three control calls the Settings page makes — `router/stop`, `router/start` and `sessions/:id?confirm=true` — each carrying the panel's same-origin header and turning a coded refusal into a `ControlRefusal` the page shows in place |
+| `src/client/worker.tsx` | The borrow page: the pending Tickets a person can bind to a conversation they already have, the Router conversation opened in the host's own chat view with its latest line, and read-only plugin discovery from the host's index |
+| `src/client/router-workspace.ts` | The virtual Router workspace: one group mounted inside the sidebar's `[data-slot="sidebar.workspaces"]` region, listing `selectRouterSessions`' rows; it suppresses a native row only for a conversation the group itself renders, and only while the group is unfolded and on screen. Nothing is persisted but the fold state and the hiding switch |
+| `src/client/session-links.ts` | Worker titles in the Router transcript become the way in: a capture-phase click listener accepts a rendered `dsh://session/…` anchor, and a transcript observer turns every known worker title (the Router's own rows plus the management catalog's) into a button that calls `openSession` |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
@@ -391,7 +400,6 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/controls.tsx` | Local copies of DeepSeek Harness's controls, which follow its markup, keyboard behaviour and design tokens, since the bundle does not import `@deepseek-ai/dsh-client-ui-primitives`; they read no context |
 | `src/client/widgets.tsx` | The small components the pages share, which read the panel's context: sections, page heads, load states, times, links, confirmed actions, the setup check and Markdown |
 | `src/client/rows.tsx` | The rows the pages share: a Ticket, a Thread and a Decision, a Thread's chip, and the folding of runs of automated messages |
-| `src/client/worker.tsx` | The Router page, which the panel opens on: the conversation with the main Session, the worker Sessions a Ticket can borrow, and the plugin index and search it reads |
 | `src/client/markdown.ts` | The Markdown subset of reports and questions, and the bare addresses in messages, as blocks and inline parts |
 | `src/client/text.ts` | Copy by key and the wording of domain values, reasons, senders and times |
 | `src/client/marks.ts` | The marks of the states the views classify: a Ticket's or a Thread's stage, a Source's state and a Decision's outcome, each as a dot, an icon, a tone and a label |
@@ -425,6 +433,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
+| `tests/control.spec.ts` | The Router switch (its own record, a stop leaves the Executor's `paused` alone, a no-op stop or start is refused, the audit trail keeps the newest entries), deletion's permission boundary (confirm, never the Router conversation, never a conversation this plugin did not create) and what leaves disk: only a session directory holding nothing but session log generations, with an ambiguous or unreadable layout retaining the bytes |
+| `tests/router-sessions.spec.ts` | The Router group's membership, row by row: only a Session whose durable header ran the router preset enters, a worker never does (whatever its preset, id prefix or projected title says, including this machine's running worker), a subagent stays out, and the order is newest first with the permanent conversation leading |
+| `tests/router-workspace.spec.tsx` | The virtual group: it hides only the rows it renders and never a worker's own row, hides nothing while folded or scrolled out of sight and again once back, writes nothing when the host read fails or the group could not mount, and turns hiding off and on through the exported switch |
+| `tests/session-link.spec.ts` | `clipUtf8` cutting on a code point inside DSH's byte budget, `workerTitle` keeping the prefix, `sessionLink` escaping its own label, `loadSessionTitles` surviving either host read failing, and `sessionIdOfHref` reading the scheme and the hash spelling and nothing else |
+| `tests/worker-workspace.spec.ts` | `workspaceKeyOf` comparing one directory through its separators and case, `WorkspaceParking` holding a second launch in the same Workspace without making another wait, and a worker Session created with `workspaceId` only and named before its first message |
+| `tests/state-lock.spec.ts` | The state directory's lock: a lock directory its holder stopped refreshing is taken after the wait, one still held is refused with the holder's trace, and a Runtime that cannot take it mounts in `lockWait` and answers the wait instead of failing |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
@@ -439,7 +453,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
-| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx`, `panel-worker.spec.tsx` | Each page of the panel, against a fake management API answered by route |
+| `tests/panel-worker.spec.tsx` | The borrow page: only conversations that can be borrowed are offered and binding a pending Ticket needs a confirmation, the Router conversation opens in the host's own chat view with its latest line, and plugin discovery says it is unavailable rather than showing a form when the host offers no index |
+| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |

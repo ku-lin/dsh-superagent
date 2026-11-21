@@ -4,7 +4,6 @@ import { createRoot, type Root } from 'react-dom/client'
 import { expect, vi } from 'vitest'
 import { App } from '../../src/client/app.tsx'
 import { usePageForm } from '../../src/client/deployment.tsx'
-import { ROUTE_KEY } from '../../src/client/route.ts'
 import { zh } from '../../src/client/locales.ts'
 import type { T } from '../../src/client/text.ts'
 import { server, usePanelServer } from './panel-server.ts'
@@ -77,4 +76,4 @@ export function field<E extends HTMLElement>(label: string): E {
   if (!match) throw new Error(`No field ${label}`)
   return match as unknown as E
 }
-export const at = (route: object) => sessionStorage.setItem(ROUTE_KEY, JSON.stringify({ route, stack: [] }))
+export const at = (route: object) => sessionStorage.setItem('dsh-superagent/route.v2', JSON.stringify({ route, stack: [] }))

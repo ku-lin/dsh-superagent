@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { ApiError, caller, usePoll } from '../src/client/api.ts'
 import { apply } from '../src/client/index.tsx'
+import { readSuppressNative } from '../src/client/router-workspace.ts'
 import { zh } from '../src/client/locales.ts'
 import { SettingsSchema } from '../src/policy.ts'
 
@@ -11,22 +12,24 @@ declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
 type Entry = { options: { name: string; id?: string; key?: string; order?: number; locale?: string; label?: () => string }; component: ComponentType<Record<string, unknown>> }
-const t = ((key: keyof typeof zh) => zh[key] ?? key) as never
-function fixture(listed: string[], phase: 'ready' | 'not-ready' = 'ready') {
+const t = (key: keyof typeof zh) => zh[key] ?? key
+function fixture(listed: string[]) {
   const entries: Entry[] = []
   const dictionaries: Record<string, unknown> = {}
+  const stops: (() => void)[] = []
   const ctx = {
     slots: { inject: (_name: string, register: () => void) => register(), register: (options: Entry['options'], component: Entry['component']) => { entries.push({ options, component }); return () => {} } },
     locale: { register: (ns: string, value: unknown) => { dictionaries[ns] = value; return () => {} }, bind: () => t },
-    effect: (effect: () => unknown) => { effect() },
-    sessions: { list: { getSnapshot: () => ({ phase, byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
+    effect: (effect: () => unknown) => { const stop = effect(); if (typeof stop === 'function') stops.push(stop as () => void) },
+    layout: { selectPanel: vi.fn() },
+    sessions: { list: { getSnapshot: () => ({ phase: 'ready', byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
     uiWorkspace: { openSession: vi.fn() },
     // Omit config form service so Deployment renders read-only.
     get: () => undefined,
   }
   apply(ctx as never)
   const entry = (name: string) => entries.find(item => item.options.name === name)!
-  return { ctx, entries, dictionaries, main: entry('main'), nav: entry('sidebar.panellist') }
+  return { ctx, entries, dictionaries, main: entry('main'), settings: entry('settings.section'), dispose: () => { stops.forEach(stop => stop()) } }
 }
 async function render(entry: Entry, props: Record<string, unknown>) {
   const container = document.createElement('div'); document.body.append(container)
@@ -49,14 +52,39 @@ const serve = () => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
 }))
 afterEach(() => { vi.unstubAllGlobals() })
 
-it('registers a localized main panel, sidebar entry and Plugin Manager row page, and no settings section', () => {
-  const { entries, dictionaries, main, nav } = fixture([])
-  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'plugins.row.config'])
+it('registers Superagent in Settings, keeps the main console and removes Router rail and footer entries', () => {
+  const { entries, dictionaries, main, settings, dispose } = fixture([])
+  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'settings.section', 'plugins.row.config'])
   expect(entries[2]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
-  expect(nav.options).toMatchObject({ id: 'dsh-superagent', order: 10, locale: 'dshSuperagent' })
-  expect(nav.options.label?.()).toBe('Router')
+  expect(settings.options).toMatchObject({ id: 'dsh-superagent', order: 36, locale: 'dshSuperagent' })
+  expect(settings.options.label?.()).toBe('Superagent')
+  dispose()
+})
+
+it('keeps Settings controls and closes Settings before opening the management console or locating the group', async () => {
+  serve()
+  window.localStorage.clear()
+  const { ctx, settings, dispose } = fixture([])
+  const close = vi.fn()
+  const view = await render(settings, { t, close })
+  const checkbox = view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+  expect(checkbox.checked).toBe(true)
+  await act(async () => { checkbox.click() })
+  expect(readSuppressNative()).toBe(false)
+  await act(async () => { checkbox.click() })
+  expect(readSuppressNative()).toBe(true)
+  const consoleButton = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.superagentOpenConsole)!
+  await act(async () => { consoleButton.click() })
+  expect(close).toHaveBeenCalledOnce()
+  expect(ctx.layout.selectPanel).toHaveBeenCalledExactlyOnceWith('dsh-superagent')
+  expect(close.mock.invocationCallOrder[0]).toBeLessThan(ctx.layout.selectPanel.mock.invocationCallOrder[0]!)
+  const locate = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.routerWorkspaceEntry)!
+  await act(async () => { locate.click() })
+  expect(close).toHaveBeenCalledTimes(2)
+  view.dispose()
+  dispose()
 })
 
 it('opens a listed Session through the workspace from the main panel', async () => {
@@ -68,24 +96,12 @@ it('opens a listed Session through the workspace from the main panel', async () 
   view.dispose()
 })
 
-// The router owns its own Session, which the client catalog does not always list: open it directly instead of reporting it missing.
-it('opens a Session the catalog does not list directly, without reporting it missing', async () => {
+it('opens the Router Session directly when the catalog omits it', async () => {
   serve()
   const { ctx, main } = fixture([])
   const view = await render(main, { t })
   await openMaster(view.container)
   expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
-  expect(document.body.textContent).not.toContain(zh.sessionNotListed)
-  view.dispose()
-})
-
-it('reports a Session list that is not ready in the interface language', async () => {
-  serve()
-  const { ctx, main } = fixture([], 'not-ready')
-  const view = await render(main, { t })
-  await openMaster(view.container)
-  expect(ctx.uiWorkspace.openSession).not.toHaveBeenCalled()
-  expect(document.body.textContent).toContain(zh.sessionListNotReady)
   view.dispose()
 })
 
@@ -153,4 +169,78 @@ it('tells a dsh-superagent that does not answer from a record it does not have, 
     status: 400, missing: false, unreachable: false })
   expect(await failure(async () => Response.json({ error: 'Unknown ticket', code: 'unknownTicket' }, { status: 404 }))).toEqual({
     message: 'user unknownTicket', status: 404, missing: true, unreachable: false })
+})
+
+it('drives the Router switch and deletes a worker conversation, never offering the Router itself', async () => {
+  const calls: { path: string; method: string; body?: unknown }[] = []
+  const running = { paused: false, reason: '', at: '', by: 'panel' as const }
+  const stopped = { paused: true, reason: 'deploy window', at: '2026-09-23T00:00:00Z', by: 'panel' as const }
+  let current: typeof running | typeof stopped = running
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
+    const target = new URL(url, 'http://127.0.0.1')
+    const path = target.pathname.replace('/orchestrator/api/', '')
+    // The query is recorded with the path: `confirm=true` is what the host requires of a deletion, so it must be visible.
+    calls.push({ path: path + target.search, method: init?.method ?? 'GET',
+      ...init?.body ? { body: JSON.parse(init.body) as unknown } : {} })
+    if (path === 'router-sessions') return Response.json({ masterId: 'master', items: [
+      { sessionId: 'master', title: 'Router', updatedAt: 1_000, running: false, agentAvailable: true },
+      { sessionId: 'worker-t1', title: 'worker-t1', updatedAt: 2_000, running: false, agentAvailable: true }] })
+    if (path === 'state') return Response.json({ masterId: 'master', router: current })
+    if (path === 'router/stop') { current = stopped; return Response.json(current) }
+    if (path === 'router/start') { current = running; return Response.json(current) }
+    if (path.startsWith('sessions/')) return Response.json({ sessionId: 'worker-t1', kind: 'worker', archived: true,
+      detached: [], projections: 'absent', log: { state: 'removed', path: '/sessions/worker-t1' } })
+    return Response.json({ error: 'unavailable' }, { status: 503 })
+  }))
+  const { settings, dispose } = fixture([])
+  const view = await render(settings, { t, close: vi.fn(), openSession: vi.fn(), openPanel: vi.fn() })
+  const button = (label: string) => [...view.container.querySelectorAll('button')]
+    .find(item => item.textContent?.includes(label)) as HTMLButtonElement | undefined
+  const settle = async () => { for (let i = 0; i < 5; i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) }) }
+  // Running: the state line says so, a reason field and a stop button are offered, and only the worker row carries a
+  // delete button — the Router's own conversation cannot delete itself and never offers one.
+  expect(view.container.textContent).toContain(t('routerRunning'))
+  expect(view.container.querySelectorAll('.dsr-delete')).toHaveLength(1)
+  await act(async () => { button(t('routerStop'))!.click() })
+  await settle()
+  expect(calls.find(call => call.path === 'router/stop')).toMatchObject({ method: 'POST', body: { reason: '' } })
+  // Stopped: the start button replaces the stop one, and the line carries the reason and time the host recorded.
+  expect(view.container.textContent).toContain(t('routerStopped'))
+  expect(view.container.textContent).toContain('deploy window')
+  expect(button(t('routerStop'))).toBeUndefined()
+  await act(async () => { button(t('routerStart'))!.click() })
+  await settle()
+  expect(calls.find(call => call.path === 'router/start')).toMatchObject({ method: 'POST' })
+  // A deletion asks through the browser's own confirmation and then sends the `confirm` the host requires.
+  const confirmed = vi.fn(() => true)
+  vi.stubGlobal('confirm', confirmed)
+  await act(async () => { (view.container.querySelector('.dsr-delete') as HTMLButtonElement).click() })
+  await settle()
+  expect(confirmed).toHaveBeenCalled()
+  expect(calls.find(call => call.path.startsWith('sessions/'))).toMatchObject({ method: 'DELETE' })
+  expect(calls.find(call => call.path.startsWith('sessions/'))?.path).toBe('sessions/worker-t1?confirm=true')
+  // The deleted row leaves the list without another host read.
+  expect(view.container.querySelectorAll('.dsr-delete')).toHaveLength(0)
+  view.dispose(); dispose()
+})
+
+it('words a refused Router control write in place, keeping the page usable', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string }) => {
+    const path = new URL(url, 'http://127.0.0.1').pathname.replace('/orchestrator/api/', '')
+    if (path === 'router-sessions') return Response.json({ masterId: 'master', items: [] })
+    if (path === 'state') return Response.json({ masterId: 'master', router: { paused: true, reason: 'x', at: '2026-09-23T00:00:00Z',
+      by: 'tool' } })
+    if (path === 'router/start' && init?.method === 'POST') return Response.json({ error: 'The Router is already running',
+      code: 'alreadyRunning' }, { status: 409 })
+    return Response.json({ error: 'unavailable' }, { status: 503 })
+  }))
+  const { settings, dispose } = fixture([])
+  const view = await render(settings, { t, close: vi.fn(), openSession: vi.fn(), openPanel: vi.fn() })
+  const start = [...view.container.querySelectorAll('button')].find(item => item.textContent?.includes(t('routerStart')))!
+  await act(async () => { start.click() })
+  for (let i = 0; i < 5; i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  // The host's own sentence is shown, and the switch still offers its buttons.
+  expect(view.container.textContent).toContain('The Router is already running')
+  expect([...view.container.querySelectorAll('button')].some(item => item.textContent?.includes(t('routerStart')))).toBe(true)
+  view.dispose(); dispose()
 })

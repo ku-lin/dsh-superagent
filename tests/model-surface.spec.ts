@@ -41,7 +41,7 @@ const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
-const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts', RUNTIME = 'src/app/runtime.ts'
+const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts'
 /** Regex patterns compiled from `orchestrator_read` resource templates (`<…>` matches one path segment; `…` matches the rest). */
 const RESOURCE_NAMES = RESOURCES.map(({ name }) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/<[^>]+>/g, '[^/\\s]+').replace('…', '.+')}$`))
 /** Report and assignment states, which text names as such; a ticket or a worker is in one of the card states (TICKET_STATES). */
@@ -262,11 +262,7 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
-    // Most inputs are JSON cards; the router's opening greeting is plain text, and it is model-facing copy too, so it is
-    // audited rather than skipped.
-    const card = ((): Record<string, unknown> | undefined => { try { return JSON.parse(text) as Record<string, unknown> } catch { return undefined } })()
-    if (!card) { surfaces.push({ where: 'orchestrator input greeting', owner: RUNTIME, role: 'orchestrator', text }); continue }
-    const value = card
+    const value = JSON.parse(text) as Record<string, unknown>
     const kind = String(value.kind ?? Object.keys(value)[0])
     const owner = kind === 'candidate' ? LINKS : kind === 'worker_attention' ? TOOLS : kind === 'worker_report' ? EXECUTOR : NOTICES
     surfaces.push({ where: `orchestrator input ${kind}`, owner, role: 'orchestrator', text })
