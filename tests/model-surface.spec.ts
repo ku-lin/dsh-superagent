@@ -34,10 +34,16 @@ type Section = (context: { signal?: AbortSignal }) => string
 interface Skill { name: string; description: string; content: string }
 
 /**
- * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
- * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
+ * Maximum combined character count of system prompt and tool definitions per role: a guard against unbounded growth,
+ * not a byte-level specification. Lower it when shrinking model-facing text; raise it only intentionally, and say why.
+ *
+ * Raised 59_000 -> 61_000 for 1.2.6-sync.1: 1.2.4–1.2.6 added three orchestrator tools
+ * (orchestrator_router_stop, orchestrator_router_start, orchestrator_session_delete) whose JSON definitions come to
+ * about 1_725 characters, so the model-facing surface legitimately grew. The four longest descriptions were tightened
+ * at the same time (route 466->425, reply 372->355, router_stop 252->219, session_delete 335->302); the rest of the
+ * growth is the feature itself, not padding, and the tools were kept rather than merged or dropped.
  */
-const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 40_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 61_000, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'

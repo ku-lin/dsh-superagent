@@ -22,6 +22,16 @@ take the `1.2.7` number, which the source tree has already reserved for the task
 - Every file `1.2.4`–`1.2.6` added: `state-lock.ts`, `control.ts`, `session-link.ts`,
   `router-sessions.ts`, the Router panel/control/workspace client modules, and their tests.
 
+### Changed
+
+- **The orchestrator's model-facing budget is now 61 000 characters** (was 59 000). `1.2.4`–`1.2.6` added three
+  orchestrator tools — `orchestrator_router_stop`, `orchestrator_router_start`, `orchestrator_session_delete` — whose
+  JSON definitions come to about **1 725 characters**, so the model-facing surface grew for a real feature. The budget
+  exists to catch unbounded growth, not to be a byte-level specification, so it was raised rather than met by cutting
+  the tools or flattening their wording. The four longest descriptions were nevertheless tightened (route 466 → 425,
+  reply 372 → 355, router_stop 252 → 219, session_delete 335 → 302). Measured after the change: **42 582 characters of
+  prompt + 18 219 of tools = 60 801**, inside the new limit with 199 to spare.
+
 ### Fixed
 
 - **The suite is green again.** Six test files still asserted the pre-`1.2.0` behaviour — the

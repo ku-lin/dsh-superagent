@@ -131,7 +131,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route candidates in one call, one item each by the card\'s trigger_id: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate, as dispatch says. Items run in order, each answered alone; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }) => {
       const decided = new Map<string, string>()
@@ -296,7 +296,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
+      description: `Send an answer to a human question, a ready result, or attention needing human action, as the replies section says; the gate refuses the rest, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed, merged or dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
         ticket_id: z.string().optional(),
@@ -428,7 +428,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_router_stop',
-      description: 'Stop the Router conversation on an explicit human request: it keeps its history and its identity, while every later message bound for it waits in the queue until the Router starts again. Running tickets and their workers are unaffected.',
+      description: 'Stop the Router conversation on an explicit human request: it keeps its history and identity, while later messages bound for it wait until the Router starts again. Running tickets and workers are unaffected.',
       schema: z.object({
         reason: z.string().trim().max(500).default('').describe('Why, in the operator\'s words; shown in the panel\'s state.'),
       }).strict(),
@@ -442,7 +442,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_session_delete',
-      description: 'Delete one conversation this Router owns on an explicit human request: a worker conversation, or a router-level one. The person\'s ordinary conversations are refused and the Router conversation cannot delete itself. The conversation stops running and leaves the lists; its stored log is reported as removed or retained.',
+      description: 'Delete one conversation this Router owns on an explicit human request: a worker or router-level one. The person\'s own conversations are refused and the Router cannot delete itself. It stops and leaves the lists; its log is reported as removed or retained.',
       schema: z.object({
         session: z.string().min(1).describe('The conversation\'s session id, as orchestrator_worker_list reports it.'),
         confirm: z.literal(true).describe('Repeat the intent: a deletion requires true.'),
