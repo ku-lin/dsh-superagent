@@ -1600,7 +1600,56 @@ it('fails a ticket at once on a worker error that is not passing, and relays it'
   const { ticket, sessionId } = await acceptedTicket()
   ;(runtime as unknown as { ctx: Context }).ctx.emit('agent/error', { agent: agents.get(sessionId), turn: 1, step: 1, error: new Error('Invalid tool schema') } as never)
   await vi.waitFor(() => expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Invalid tool schema') }))
-  expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: ticket.id }, state: 'failed' })
+  // The report reaches the main Session as it always did; the deterministic failure alert follows it in the same
+  // transaction, so what the Router reads last is the alert that says a fixed code path recorded a stop.
+  const sent = relays(runtime.masterId)
+  const reports = sent.filter(item => item['kind'] === 'worker_report')
+  expect(reports.at(-1)).toMatchObject({ ticket: { ticket_id: ticket.id }, state: 'failed' })
+  expect(sent.at(-1)).toMatchObject({ kind: 'worker_failure', ticket_id: ticket.id, failure_kind: 'agent-error' })
+  expect(runtime.store.get(KV.runtime.failures)?.at(-1)).toMatchObject({ ticketId: ticket.id, kind: 'agent-error', source: 'executor' })
+})
+
+/**
+ * A shell job that broke is the other process-level failure a worker's turn cannot see: the job settles inside DSH, so
+ * the ticket learns of it from `job/settled` in the Session log. The event's `status` decides — `completed` and `killed`
+ * are not failures (a stop this plugin asked for is `killed`), and only `failed` becomes a record, carrying the producer's
+ * own `exit code: N` when one is spelled in `detail`.
+ */
+it('records a failed shell job as a crash, and its exit code when the producer spelled one', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  // The handler reads only `session.id` to find the ticket that owns the conversation, so that is all this passes.
+  const session = { id: sessionId } as never
+  const settled = (data: Record<string, unknown>) => ctx.emit('session/event', session, { type: 'job/settled', data } as never)
+
+  // A job that finished on its own, and one this plugin killed, are not failures: nothing is recorded for either.
+  settled({ jobId: 'job-ok', owner: sessionId, kind: 'pwsh', label: 'npm run build', startedAt: 1, finishedAt: 2, status: 'completed', cause: 'producer', producerReported: true })
+  settled({ jobId: 'job-killed', owner: sessionId, kind: 'pwsh', label: 'npm run watch', startedAt: 1, finishedAt: 2, status: 'killed', cause: 'consumer', producerReported: true, detail: 'stopped by the supervisor' })
+  await runtime.idle()
+  expect(runtime.store.get(KV.runtime.failures) ?? []).toHaveLength(0)
+
+  // A producer that reported no code leaves a `crash`: the job broke, and no exit status was spelled.
+  settled({ jobId: 'job-crash', owner: sessionId, kind: 'pwsh', label: 'npm run lint', startedAt: 1, finishedAt: 2, status: 'failed', cause: 'producer', producerReported: true, detail: 'OOM' })
+  await vi.waitFor(() => expect(runtime.store.get(KV.runtime.failures)?.at(-1)).toMatchObject({ ticketId: ticket.id, kind: 'crash', source: 'session' }))
+  expect(runtime.store.get(KV.runtime.failures)!.at(-1)!.detail).toContain('OOM')
+
+  // The producer's own sentence is where a shell command's exit status is spelled: that one is an `exit` with the code.
+  settled({ jobId: 'job-exit', owner: sessionId, kind: 'pwsh', label: 'git push', startedAt: 1, finishedAt: 2, status: 'failed', cause: 'producer', producerReported: false, detail: 'exit code: 3' })
+  await vi.waitFor(() => expect(runtime.store.get(KV.runtime.failures)?.at(-1)).toMatchObject({ ticketId: ticket.id, kind: 'exit', source: 'session', exitCode: 3 }))
+
+  // Each record also reached the Router as an alert, after the report that describes the same stop.
+  const sent = relays(runtime.masterId).filter(item => item['kind'] === 'worker_failure')
+  expect(sent.map(item => item['failure_kind'])).toEqual(['crash', 'exit'])
+  expect(sent.at(-1)).toMatchObject({ ticket_id: ticket.id, exit_code: 3 })
+})
+
+it('ignores a job that settled in a conversation no ticket owns', async () => {
+  const { ticket } = await acceptedTicket()
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  const stranger = [...agents.keys()].find(id => id !== `worker-${ticket.id}`)!
+  ctx.emit('session/event', { id: stranger } as never, { type: 'job/settled', data: { jobId: 'job-other', owner: stranger, kind: 'pwsh', label: 'ls', startedAt: 1, finishedAt: 2, status: 'failed', cause: 'producer', producerReported: false } } as never)
+  await runtime.idle()
+  expect(runtime.store.get(KV.runtime.failures) ?? []).toHaveLength(0)
 })
 
 it('refuses the main Session a bash command that runs sleep and a long job wait, as reports arrive by themselves, and no worker', async () => {
