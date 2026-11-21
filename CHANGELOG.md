@@ -9,6 +9,40 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [1.2.6] - 2026-11-21
+
+Operator control over the Router conversation: stop it, start it again, and delete the conversations this plugin owns.
+All three writes are audited, require the panel's same-origin request header, and live under `/orchestrator/api/`.
+
+### Added
+
+- **Stop and start the Router from Settings › Superagent.** `POST router/stop` records `paused: true` with an optional
+  reason and `POST router/start` clears it; `GET state` reports the switch as `router`, next to — and separate from — the
+  Executor's own `paused`. Stopping deletes nothing and loses no history: every message bound for the Router conversation
+  waits in the durable effect queue (the `relay` effect's new `queue` delivery) and is handed over in arrival order once
+  the Router starts again. Running Tickets and their workers keep working, because the Executor's gate is untouched.
+- **Delete a worker or router-level conversation.** `DELETE sessions/:id?confirm=true` archives the conversation, stops
+  its work, detaches it from every Workspace that accounted for it, drops its projection-cache row and removes its stored
+  log when the persistence backend exposes a root. `confirm` is required, and the permanent Router conversation refuses to
+  delete itself — the panel offers no button for it either. A conversation this plugin did not create is refused, so a
+  person's own conversations are never touched. The report says what happened, including whether the log was `removed`,
+  `absent` or `retained` (with the reason).
+- **The same three operations as model tools** (`orchestrator_router_stop`, `orchestrator_router_start`,
+  `orchestrator_session_delete`), each describing the explicit human request it needs. A no-op is answered as a refusal
+  carrying the current state, instead of failing the turn.
+- **An audit trail** of the panel's and the tools' writes (`router-switch` and `audit` in the store, newest 200 kept),
+  naming the operation, its target, the origin and whether it took effect.
+
+### Changed
+
+- `POST router-chat` answers `{ sent: true, queued: true }` while the Router is stopped, so the panel can say the message
+  is waiting rather than delivered. A worker's answer to the Router goes through the same queue instead of waking it.
+
+### Notes
+
+- `router/stop`, `router/start` and `DELETE sessions/:id` are served by the host, so a running DeepSeek Harness picks them
+  up only after it restarts; the Settings buttons need a page reload (or a client-plugin HMR rebuild) as well.
+
 ## [1.2.5] - 2026-11-21
 
 ### Changed

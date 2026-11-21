@@ -91,6 +91,8 @@ export interface SessionsHost {
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
+  /** Whether the Router conversation is stopped, which holds every message bound for it instead of dropping it. */
+  routerStopped(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
@@ -169,8 +171,11 @@ export class Sessions {
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
-    // Deliver relays and notices to the main Session in the order they were queued.
-    host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
+    // Deliver relays and notices to the main Session in the order they were queued. A relay is held while the Router is
+    // stopped: steering would start the Router's turn, and a queued one would too, so both kinds wait in the durable queue
+    // instead — the row survives a restart, and a start hands it over in arrival order.
+    host.effects.handle('relay', ({ text, queue }, requestId) => this.prompt(host.masterId, requestId, text, queue ? 'queue' : 'steer'),
+      { ordered: true, limit: () => host.routerStopped() ? 0 : 1 })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
@@ -368,6 +373,16 @@ export class Sessions {
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
+  /**
+   * Enqueues one message for the Router conversation as an ordinary next turn.
+   *
+   * Every path that hands the Router something to read — a person typing in the panel, a worker's answer — goes through
+   * here, so a stopped Router queues work instead of being woken by it. The queue row is durable and deduplicated by
+   * `requestId`, exactly like the other effects; a start releases it in arrival order.
+   * @param requestId - idempotency key of this delivery.
+   * @param text - the message.
+   */
+  routerMessage(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text, queue: true }) }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
   /** Waits for currently runnable `notice` effects to settle and returns `'injected'` if notice `name` has reached the main Session or `'pending'` if it is still queued. */

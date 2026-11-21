@@ -9,6 +9,7 @@ import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssess
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import { ControlError, type Control } from '../control.ts'
 import { sessionLink } from '../session-link.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
@@ -23,8 +24,10 @@ export interface MainToolsHost {
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt' | 'routerMessage'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
+  /** The Router switch and conversation deletion (`orchestrator_router_*`, `orchestrator_session_delete`). */
+  readonly control: Pick<Control, 'router' | 'stopRouter' | 'startRouter' | 'deleteSession' | 'sessionKind'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
@@ -192,7 +195,7 @@ function answerAfter(agent: Agent, from: number): string {
  * This is the inter-session conversation the Router runs on: no polling, no timer of its own, and the answer waits in the
  * Router's inbox like any other message a person or a source sends it.
  */
-async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, from: number, title: string,
+async function answerLater(host: MainToolsHost, _router: Agent, worker: Agent, from: number, title: string,
   signal: AbortSignal): Promise<void> {
   const idle = (): boolean => worker.status === 'idle'
   if (!idle()) {
@@ -204,14 +207,24 @@ async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, fr
   if (signal.aborted) return
   const reply = answerAfter(worker, from)
   if (!reply) return
-  await host.sessions.prompt(router.id, key('worker-answer', worker.id, String(Date.now())),
-    `Answer from ${title}:\n${reply}`, 'queue').catch(() => { /* The Router's own turn may refuse it; the text stays in the worker. */ })
+  // Through the Router's own delivery queue, so a stopped Router holds the answer instead of being woken by it.
+  host.sessions.routerMessage(key('worker-answer', worker.id, String(Date.now())), `Answer from ${title}:\n${reply}`)
 }
 /** Resolves when the conversation's turn ends, or false on timeout or when the caller is cancelled. */
 async function untilIdle(agent: Agent, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
   const wait = (ms: number) => new Promise<boolean>(resolve => { setTimeout(() => resolve(false), ms) })
   const cancelled = new Promise<boolean>(resolve => { signal.addEventListener('abort', () => resolve(false), { once: true }) })
   return await Promise.race([agent.whenIdle().then(() => true), wait(timeoutMs), cancelled])
+}
+/**
+ * The Router's own switch as a tool answer: the state a person reads, refused as a refusal when it cannot change.
+ * A control refusal is the model's to report, not an exception that fails the whole turn.
+ */
+function switched(host: MainToolsHost, run: () => { paused: boolean; reason: string; at: string }) {
+  try { return { router: run(), reason: '' } } catch (error) {
+    if (error instanceof ControlError) return { router: host.control.router, refused: error.message, code: error.code }
+    throw error
+  }
 }
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -411,6 +424,34 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const finished = await untilIdle(worker, args.wait_seconds * 1000, signal)
         const reply = answerAfter(worker, from)
         return { session: sessionId, title, link: sessionLink(sessionId, title), delivered: true, finished, ...(reply ? { reply } : {}) }
+      },
+    }),
+    tool({
+      name: 'orchestrator_router_stop',
+      description: 'Stop the Router conversation on an explicit human request: it keeps its history and its identity, while every later message bound for it waits in the queue until the Router starts again. Running tickets and their workers are unaffected.',
+      schema: z.object({
+        reason: z.string().trim().max(500).default('').describe('Why, in the operator\'s words; shown in the panel\'s state.'),
+      }).strict(),
+      execute: async args => switched(host, () => host.control.stopRouter(args.reason, 'tool')),
+    }),
+    tool({
+      name: 'orchestrator_router_start',
+      description: 'Start the Router conversation again on an explicit human request: messages the stop held are handed over in the order they arrived.',
+      schema: z.object({}).strict(),
+      execute: async () => switched(host, () => host.control.startRouter('tool')),
+    }),
+    tool({
+      name: 'orchestrator_session_delete',
+      description: 'Delete one conversation this Router owns on an explicit human request: a worker conversation, or a router-level one. The person\'s ordinary conversations are refused and the Router conversation cannot delete itself. The conversation stops running and leaves the lists; its stored log is reported as removed or retained.',
+      schema: z.object({
+        session: z.string().min(1).describe('The conversation\'s session id, as orchestrator_worker_list reports it.'),
+        confirm: z.literal(true).describe('Repeat the intent: a deletion requires true.'),
+      }).strict(),
+      execute: async args => {
+        try { return await host.control.deleteSession(args.session, args.confirm, 'tool') } catch (error) {
+          if (error instanceof ControlError) return { refused: error.message, code: error.code, session: args.session }
+          throw error
+        }
       },
     }),
   ]

@@ -11,6 +11,8 @@ import type { RouterSessionRow } from './router-sessions.ts'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
+import type { Control } from './control.ts'
+import { ControlError } from './control.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { lockPath, type LockRefusal } from './state-lock.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
@@ -57,6 +59,8 @@ export interface HttpHost {
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount' | 'bindingInProgress'>
+  /** The Router switch and the deletion of the conversations this plugin owns (`HTTP` route `router/*`, `sessions/:id`). */
+  readonly control: Control
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -104,6 +108,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError) return [error.status, { error: error.message }]
+  if (error instanceof ControlError) return [error.status, { error: error.message, code: error.code }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
@@ -122,10 +127,12 @@ function setupView(runtime: HttpHost) {
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
-  const settings = runtime.store.settings()
+  const settings = runtime.store.settings(), router = runtime.control.router
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    // The Router's own switch is separate from `paused`: stopping the Router never stops Tickets or their workers.
+    router: { paused: router.paused, reason: router.reason, at: router.at, by: router.by } }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -230,6 +237,21 @@ function routes(runtime: HttpHost): Routes {
     'POST router-chat': async ({ body }) => {
       const { text } = z.object({ text: z.string().trim().min(1).max(8000) }).strict().parse(await body())
       return runtime.routerSend(text)
+    },
+    /** Stop the Router: its conversation keeps everything it has, and every further message waits in the durable queue. */
+    'POST router/stop': async ({ body }) => {
+      const { reason } = z.object({ reason: z.string().max(500).default('') }).strict().parse(await body())
+      return runtime.control.stopRouter(reason, 'panel')
+    },
+    /** Start the Router again: what the stop held is handed over in arrival order. */
+    'POST router/start': () => runtime.control.startRouter('panel'),
+    /**
+     * Delete one worker or router-level conversation. `confirm=true` is required; the permanent Router conversation, and
+     * any conversation this plugin does not own, are refused.
+     */
+    'DELETE sessions/:id': async ({ params, query }) => {
+      const confirm = z.enum(['true', 'false']).catch('false').parse(query.confirm) === 'true'
+      return runtime.control.deleteSession(params.id, confirm, 'panel')
     },
     'GET dsh-sessions': async () => {
       const leases = new Map(store.tickets.open().flatMap(ticket => ticket.execution?.borrowedSession

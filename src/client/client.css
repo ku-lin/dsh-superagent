@@ -426,3 +426,10 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
   .dt-worker-layout { grid-template-columns: minmax(0, 1fr); }
   .dt-worker-rail { padding-left: 0; border-left: 0; border-top: 1px solid var(--dsw-alias-border-l2); padding-top: 8px; }
 }
+/* Router switch and per-row delete control on the Superagent Settings page. */
+.dsr-switch { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: 12px; }
+.dsr-switch-state { margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; }
+.dsr-switch-reason { width: 100%; box-sizing: border-box; }
+.dsr-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dsr-row-open { flex: 1 1 auto; min-width: 0; }
+.dsr-delete { flex: 0 0 auto; }

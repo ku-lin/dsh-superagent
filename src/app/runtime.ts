@@ -32,6 +32,7 @@ import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, registerLockWaitHttp, type HttpHost } from './http.ts'
+import { Control, routerStopped, sessionRoot } from './control.ts'
 import { acquireStateLock, describeLock, lockPath, type LockAttempt, type LockPolicy, type LockRefusal } from './state-lock.ts'
 import { selectRouterSessions } from './router-sessions.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -139,6 +140,7 @@ export class Runtime extends Service implements SourceHost {
   readonly outbox!: Outbox
   readonly engine!: Engine
   readonly passes!: Passes
+  readonly control!: Control
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
@@ -216,7 +218,8 @@ export class Runtime extends Service implements SourceHost {
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
-        closing: () => this.closing(), environment,
+        closing: () => this.closing(), routerStopped: () => routerStopped(store),
+        environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
@@ -253,10 +256,16 @@ export class Runtime extends Service implements SourceHost {
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, ready: () => setup.ready(), closing: () => this.closing() })
+      // The operator's control over the Router conversation: the stop/start switch, its audit trail, and deletions of the
+      // conversations this plugin owns. It reads the switch from the store on every delivery, so a stop takes effect on the
+      // next handoff and a start releases what the stop held.
+      this.control = new Control({ context: ctx, store, masterId, requestPass: () => { passes.request() },
+        sessionRoot: () => sessionRoot(ctx) })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
       get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
+        control: this.control,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         titleOf: async (sessionId: string) => {
@@ -374,6 +383,7 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+      control: this.control,
       // DSH's session calls queue behind a running turn; a bounded read keeps the panel from showing an endless spinner.
       listDshSessions: async () => bounded(this.ctx.sessionController.list({}, new AbortController().signal).then(listed => listed.items), 'the DSH session list'),
       /** The router conversation's last exchanges, so the panel can show it as the permanent chat it is. */
@@ -443,10 +453,11 @@ export class Runtime extends Service implements SourceHost {
         const found = events.find(event => event.type === type)
         return { found: found ? JSON.stringify(found).slice(0, 1200) : null }
       },
-      /** Delivers one message into the router conversation; its reply arrives as the conversation runs. */
+      /** Delivers one message into the router conversation; its reply arrives as the conversation runs. A stopped Router
+       * holds it in the durable queue instead of waking, and a start hands it over in arrival order. */
       routerSend: async text => {
-        await runtime.sessions.prompt(runtime.masterId, key('router-chat', String(Date.now()), text), text, 'queue')
-        return { sent: true as const }
+        runtime.sessions.routerMessage(key('router-chat', String(Date.now()), text), text)
+        return { sent: true as const, ...(runtime.control.stopped ? { queued: true as const } : {}) }
       },
       // `get` returns undefined when no Plugin Market is mounted; a property access would throw without an injection.
       get pluginMarket() { return runtime.ctx.get('pluginMarket') as HttpHost['pluginMarket'] | undefined },

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { DeleteReport, RouterSwitch } from '../../src/app/control.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -94,6 +95,10 @@ export interface PanelServer {
   pluginResults: ApiResponse<'GET plugin-search'>
   routerChat: ApiResponse<'GET router-chat'>
   routerSessions: ApiResponse<'GET router-sessions'>
+  /** The Router's stop/start switch, as `GET state` reports it and the two control routes change it. */
+  router: RouterSwitch
+  /** Conversations the panel asked to delete, in order. */
+  deleted: string[]
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
@@ -167,6 +172,7 @@ const stateView = (): StateView => ({
   masterId: 'master', paused: server.settings.paused,
   // The panel does not read health; the service script does.
   health: {},
+  router: server.router,
 })
 const settingsView = (): ApiResponse<'GET settings'> => ({
   policyVersion: 'abcdef1234567890',
@@ -265,6 +271,8 @@ function initial(): PanelServer {
     pluginResults: { entries: [], total: 0, nextOffset: null },
     routerChat: { sessionId: 'master', items: [] as { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] },
     routerSessions: { masterId: 'master', items: [] },
+    router: { paused: false, reason: '', at: '', by: 'panel' },
+    deleted: [],
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
@@ -344,7 +352,29 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'POST router-chat': { body: true, answer: ({ body }) => {
     const text = (body as { text: string }).text
     server.routerChat = { ...server.routerChat, items: [...server.routerChat.items, { role: 'user', text, dispatched: [] }] }
-    return { sent: true as const }
+    // A stopped Router holds the message instead of handing it over, exactly as the host's durable queue does.
+    return server.router.paused ? { sent: true as const, queued: true as const } : { sent: true as const }
+  } },
+  'POST router/stop': { body: true, answer: ({ body }) => {
+    if (server.router.paused) return refuse(409, 'The Router is already stopped', { code: 'alreadyStopped' })
+    const { reason } = z.object({ reason: z.string().max(500).default('') }).strict().parse(body)
+    server.router = { paused: true, reason, at: new Date().toISOString(), by: 'panel' }
+    return server.router
+  } },
+  'POST router/start': { answer: () => {
+    if (!server.router.paused) return refuse(409, 'The Router is already running', { code: 'alreadyRunning' })
+    server.router = { paused: false, reason: '', at: new Date().toISOString(), by: 'panel' }
+    return server.router
+  } },
+  'DELETE sessions/:id': { query: ['confirm'], answer: ({ params, query }) => {
+    if (query.confirm !== 'true') return refuse(400, 'Deleting a conversation requires confirm: true', { code: 'confirmRequired' })
+    if (params.id === 'master') return refuse(409, 'The Router conversation cannot delete itself', { code: 'routerSession' })
+    const known = params.id.startsWith('worker-') || server.routerSessions.items.some(row => row.sessionId === params.id)
+    if (!known) return refuse(409, 'Only a worker conversation or a router-level conversation can be deleted', { code: 'notDeletable' })
+    server.deleted.push(params.id)
+    const report: DeleteReport = { sessionId: params.id, kind: params.id.startsWith('worker-') ? 'worker' : 'router', archived: true,
+      detached: [], projections: 'absent', log: { state: 'removed', path: '/sessions/' + params.id } }
+    return report
   } },
   'GET plugin-indexes': { answer: () => server.pluginIndexes },
   'GET plugin-search': { query: ['url', 'text'], answer: () => server.pluginResults },
