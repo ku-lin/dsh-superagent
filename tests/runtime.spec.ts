@@ -215,7 +215,9 @@ beforeEach(async () => {
   jobs = jobRegistry()
   services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }),
     // The host's archive set: deleting a conversation archives it and asks the providers to stop its work.
-    archiveSession: vi.fn(async () => {}), list: () => [] as { id: string; title: string; sessionIds: never[]; detachSession: () => Promise<void> }[] }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+    archiveSession: vi.fn(async () => {}), list: () => [] as { id: string; title: string; sessionIds: never[]; detachSession: () => Promise<void> }[] }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { kind?: string; handler: HttpHandler }) => {
+      // Only the management prefix answers these cases; the exact change-stream route is a different contract.
+      if (route.kind !== 'exact') http = route.handler; return () => {} } }, jobs: jobs.service }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()

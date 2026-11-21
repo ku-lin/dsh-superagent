@@ -348,6 +348,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
+| `src/app/tasks.ts` | `TaskboardReader` and `taskboardDatabase`: `GET tasks`, the read-only projection of the Taskboard plugin's SQLite file that the Router's task list polls — one `readOnly` connection per refresh, closed in the same call, cached for five seconds, and `available: false` with a sentence when the board is missing or locked |
+| `src/app/task-status.ts` | The Taskboard's statuses and priorities as plain data, with `taskStatus` and `taskPriority` falling back to the board's own defaults; it imports nothing, so the panel takes the words without pulling `node:sqlite` into the browser bundle |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
@@ -404,6 +406,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/text.ts` | Copy by key and the wording of domain values, reasons, senders and times |
 | `src/client/marks.ts` | The marks of the states the views classify: a Ticket's or a Thread's stage, a Source's state and a Decision's outcome, each as a dot, an icon, a tone and a label |
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
+| `src/client/task-list.tsx` | The Router's task list: a collapsible rail to the right of the panel column, with the project selector, the refresh button and the time of the read, the `进行中 / 待审 / 阻塞` counts, one row per task with its identifier, its title and a status badge, the "show finished" switch, and the 30-second poll whose failure is a sentence rather than an error; the fold state, the switch and the selected project live in `sessionStorage` |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
@@ -456,6 +459,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/panel-worker.spec.tsx` | The borrow page: only conversations that can be borrowed are offered and binding a pending Ticket needs a confirmation, the Router conversation opens in the host's own chat view with its latest line, and plugin discovery says it is unavailable rather than showing a form when the host offers no index |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
+| `tests/tasks.spec.ts` | `GET tasks` against a real SQLite board built by the test: the projects and their tasks newest first, the case-insensitive `?project=` filter, archived rows left out and the per-project row budget, an unknown status reading as the board's fallback, a missing board answering a sentence, the five-second cache, the store's location from the service then `$DSH_HOME` then home, and the route's same-origin fence |
+| `tests/panel-tasks.spec.tsx` | The task-list rail: every project's unfinished tasks with their status badges, finished ones behind "show finished", the project filter and the copy-identifier click, the `进行中 / 待审 / 阻塞` counts, the collapse that keeps its count across a remount, and the two degraded answers — a board that is not there and a route that fails — neither of which throws or toasts |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |

@@ -1,9 +1,11 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
 import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { DeleteReport, RouterSwitch } from './control.ts'
+import type { FailureKind, FailureRecord } from './failures.ts'
 import type { PromptConfig, Prompts } from './prompts.ts'
 import type { RouterSessionRow } from './router-sessions.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
+import type { TasksView } from './tasks.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
 import type { SettingsView } from './views/settings.ts'
@@ -18,6 +20,19 @@ export type ThreadFilter = typeof THREAD_FILTERS[number]
 interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
+/** The `GET worker/failures` answer: the newest records first, and how many the filter matched in all. */
+export interface FailureListView { items: FailureRecord[]; total: number }
+/** What an external process sends to `POST worker/failure`; only `detail` is always known. */
+export interface FailureRequest {
+  kind?: FailureKind
+  ticket?: string
+  session?: string
+  detail: string
+  exitCode?: number
+  source?: 'api' | 'executor' | 'session'
+}
+/** The route's answer: the stored record, or the fact that the window suppressed a repeat. */
+export type FailureReport = { recorded: true; failure: FailureRecord } | { recorded: false; duplicate: true }
 
 export interface Api {
   'GET state': { response: StateView }
@@ -55,6 +70,24 @@ export interface Api {
   'DELETE sessions/:id': { query?: { confirm?: string }; response: DeleteReport }
   'GET router-events': { response: { counts: { type: string; count: number }[] } }
   'GET router-event-sample': { query?: { type?: string }; response: { found: string | null } }
+  /**
+   * Read-only Taskboard rows for the Router's task-list panel: every project with its unfinished tasks, or one project
+   * when `project` names its key. The board belongs to the Taskboard plugin; this route opens it read-only and answers
+   * `available: false` with a sentence when it cannot (a board that does not exist yet is not an error).
+   */
+  'GET tasks': { query?: { project?: string }; response: TasksView }
+  /**
+   * The ordered log of failures a fixed code path recorded (a worker that ended in an error, a turn whose reason was
+   * `error`, a disposed worker with a running assignment, a `failed`/`blocked` report, a prepare timeout, a shell job's
+   * non-zero exit, a failed launch). Newest first; `total` counts every record the filter matched.
+   */
+  'GET worker/failures': { query?: { ticket?: string; kind?: FailureKind; limit?: number }; response: FailureListView }
+  /**
+   * Report one failure from outside this process, so a wrapper that sees a worker die records it without a model in
+   * the loop. Same-origin fenced like every other write; a repeat inside the sixty-second window answers
+   * `{ recorded: false, duplicate: true }` instead of failing.
+   */
+  'POST worker/failure': { body: FailureRequest; response: FailureReport }
   /** Read-only list of configured plugin market sources; no network fetch. */
   'GET plugin-indexes': { response: { available: boolean; items: { url: string; title?: string | Record<string, string>; error?: string }[] } }
   /** Explicit read-only search of one configured plugin market source; never installs. */

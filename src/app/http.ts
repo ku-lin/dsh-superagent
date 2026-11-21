@@ -32,6 +32,9 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import { FAILURE_KINDS, type FailureKind, type FailureLog, type FailureSource } from './failures.ts'
+import type { StreamHub } from './stream.ts'
+import type { TasksView } from './tasks.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -61,6 +64,8 @@ export interface HttpHost {
   readonly executor: Pick<DshExecutor, 'activeCount' | 'bindingInProgress'>
   /** The Router switch and the deletion of the conversations this plugin owns (`HTTP` route `router/*`, `sessions/:id`). */
   readonly control: Control
+  /** Read-only Taskboard rows for the Router's task-list panel; never writes the board. */
+  readonly tasks: { read(project?: string): TasksView }
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -76,6 +81,9 @@ export interface HttpHost {
   checkSetup(): void
   requestPass(): void
   models(): Promise<ModelCatalog>
+  /** The panel's live channel: the change bus, the failure log, and the SSE route that holds a response open. */
+  readonly stream: StreamHub
+  readonly failures: FailureLog
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -125,7 +133,22 @@ function setupView(runtime: HttpHost) {
     accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
-/** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
+/**
+ * The failure log as `GET worker/failures` answers it: newest first, optionally narrowed to one ticket, one kind, or
+ * the recent window the panel's "异常" list shows.
+ */
+function failureList(runtime: HttpHost, query: Record<string, string>) {
+  const { ticket, kind, limit: asked } = z.object({ ticket: z.string().optional(), kind: z.enum(FAILURE_KINDS).optional(),
+    limit: z.coerce.number().int().positive().catch(50) }).parse(query)
+  // A report a person just sent may not be in the log yet on a host that restarted: an empty answer is honest.
+  const all = runtime.failures.list()
+  const shown = all.filter(record => (ticket === undefined || record.ticketId === ticket) && (kind === undefined || record.kind === kind))
+  const newest = [...shown].reverse().slice(0, Math.min(asked, 200))
+  return { items: newest, total: shown.length }
+}
+/**
+ * Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`).
+ */
 export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings(), router = runtime.control.router
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
@@ -173,6 +196,24 @@ const PromptsQuery = z.object({ revision: count.optional(), offset: count.defaul
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
+/**
+ * A failure report from an external process. Every field the alert is built from is required except the ones a
+ * process genuinely may not know: the ticket and the session it was working on, and the exit code of a process that
+ * was killed by a signal rather than by an exit.
+ *
+ * `ticket` and `session` are opaque names: a worker conversation is named `worker-<ticket>` by this plugin, but a
+ * crash reporter may know only one of them, and a report that names neither is still worth recording (it is what a
+ * person reads when nothing else survives).
+ */
+const FailureRequest = z.object({
+  kind: z.enum(FAILURE_KINDS).default('crash'),
+  ticket: z.string().trim().min(1).max(300).optional(),
+  session: z.string().trim().min(1).max(300).optional(),
+  detail: z.string().trim().min(1).max(4000),
+  exitCode: z.number().int().min(-2_147_483_648).max(2_147_483_647).optional(),
+  /** Recorded per report only when a caller states it; an external process never claims to be the executor. */
+  source: z.enum(['api', 'executor', 'session']).default('api'),
+}).strict()
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
@@ -216,6 +257,25 @@ function routes(runtime: HttpHost): Routes {
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
+    /** What the Router's task-list panel shows: the Taskboard's projects and their tasks, read-only. */
+    'GET tasks': ({ query }) => runtime.tasks.read(query.project ?? ''),
+    /** The ordered log of failures a fixed code path recorded; newest last, capped by `FAILURE_LIMIT`. */
+    'GET worker/failures': ({ query }) => failureList(runtime, query),
+    /**
+     * Report a failure from outside this process. The route is same-origin fenced like every other write, and it is
+     * reached by `scripts/report-failure.mjs` so a wrapper that sees a worker die can record it without a model in the
+     * loop. A suppressed duplicate answers `{ recorded: false, duplicate: true }` rather than failing.
+     */
+    'POST worker/failure': async ({ body }) => {
+      const request = FailureRequest.parse(await body(16 * 1024))
+      const record = runtime.failures.record({ kind: request.kind as FailureKind, source: request.source as FailureSource,
+        detail: request.detail, ...request.ticket === undefined ? {} : { ticketId: request.ticket },
+        ...request.session === undefined ? {} : { sessionId: request.session },
+        ...request.exitCode === undefined ? {} : { exitCode: request.exitCode } })
+      // A ticket named by a report is re-read by the panel even when the window suppressed the alert.
+      runtime.stream.publish('tickets')
+      return record ? { recorded: true as const, failure: record } : { recorded: false as const, duplicate: true as const }
+    },
     'GET plugin-indexes': () => ({ available: !!runtime.pluginMarket, items: runtime.pluginMarket?.listIndexes() ?? [] }),
     'GET plugin-search': async ({ query }) => {
       const market = runtime.pluginMarket
@@ -354,6 +414,25 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       } catch (error) { json(res, ...failure(error)) }
     } })]
   return () => { for (const dispose of disposers) dispose() }
+}
+/**
+ * Register the panel's live channel as its own exact route.
+ *
+ * It is kept out of {@link registerHttp} on purpose. The JSON routes answer and end; this one takes ownership of the
+ * response and holds it, which is a different contract, and an exact path wins over the `/orchestrator` prefix without
+ * reordering anything. Registering it separately also means a host that refuses the second route (an occupied path, or
+ * a web server double in a test) loses only the live channel: the panel falls back to its manual refresh, and every
+ * management route keeps working.
+ * @returns the disposer that unmounts the route.
+ */
+export function registerStream(ctx: Context, runtime: Pick<HttpHost, 'stream'>): () => void {
+  return ctx.webServer.register({ kind: 'exact', path: '/orchestrator/api/stream', handler: (req, res) => {
+    if ((req.method ?? 'GET') !== 'GET') { json(res, 405, { error: 'The change stream is read with GET' }); return }
+    if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+    // A response that cannot hold a stream is answered, never thrown out of: the panel then shows 已断开 with its
+    // manual refresh, which is the same state a dropped connection produces.
+    if (!runtime.stream.attach(req, res)) json(res, 503, { error: 'This host cannot hold a change stream' })
+  } })
 }
 /** What a process waiting for the state directory's lock answers with: the lock it could not take and the health it reports. */
 export interface LockWaitView {

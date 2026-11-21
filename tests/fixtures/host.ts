@@ -247,7 +247,9 @@ export async function startRuntime(seed?: (store: Store) => void) {
   }
   const reader = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
   const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async () => reader) }
-  const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
+  // Only the management prefix answers these cases; the exact change-stream route holds a response instead.
+  const webServer = { host: '127.0.0.1', port: 3082,
+    register: (route: { kind?: string; handler: HttpHandler }) => { if (route.kind !== 'exact') http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,

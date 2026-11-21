@@ -7,6 +7,8 @@ import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
+import { exitCodeOf, type FailureLog } from '../failures.ts'
+import { executionSessionId } from '../../executor/dsh.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
@@ -17,6 +19,12 @@ export interface ExecutorToolsHost {
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  /**
+   * The deterministic failure log. A worker that reports `failed` or `blocked` recorded the reason itself, so the
+   * record is what a person reads in the panel's 异常 list and what the Router is told — no model decides whether to
+   * send it: the report *is* the send.
+   */
+  readonly failures: Pick<FailureLog, 'record'>
   sendReplies(): Promise<void>
 }
 
@@ -98,6 +106,15 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const updated = host.engine.report(ticketId, report)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
+          // A worker's own `failed` or `blocked` report is a stop caused by an error or an obstacle: it enters the
+          // failure log in this same transaction, so the panel's 异常 list and the Router's queue cannot disagree with
+          // the ticket. `progress`, `ready` and `dropped` are not failures and record nothing.
+          if (report.state === 'failed' || report.state === 'blocked') {
+            const code = exitCodeOf(report.summary)
+            host.failures.record({ kind: report.state === 'failed' ? 'report-failed' : 'agent-error', source: 'executor',
+              detail: `${report.state}: ${report.summary}`, ticketId, sessionId: executionSessionId(updated),
+              ...code === undefined ? {} : { exitCode: code } })
+          }
           const notification = relay ? 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
         })

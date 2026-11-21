@@ -15,7 +15,7 @@ import { mkdirSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { sameDirectory } from '../infra/environment.ts'
-import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, reasonText, type DomainEvent, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -30,8 +30,11 @@ import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
+import { FailureLog } from './failures.ts'
+import { StreamHub, type StreamTopic } from './stream.ts'
 import { Prompts } from './prompts.ts'
-import { registerHttp, registerLockWaitHttp, type HttpHost } from './http.ts'
+import { registerHttp, registerLockWaitHttp, registerStream, type HttpHost } from './http.ts'
+import { TaskboardReader, taskboardDatabase } from './tasks.ts'
 import { Control, routerStopped, sessionRoot } from './control.ts'
 import { acquireStateLock, describeLock, lockPath, type LockAttempt, type LockPolicy, type LockRefusal } from './state-lock.ts'
 import { selectRouterSessions } from './router-sessions.ts'
@@ -55,6 +58,24 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+/**
+ * Which refetch a domain event asks the panel for, or `undefined` for one no open view shows.
+ *
+ * The map is deliberately small and explicit: a topic is a route the panel already has, and publishing one it does not
+ * listen to would only be noise. Triggers, Decisions and Threads all land in Overview and the Thread list, which the
+ * panel refetches together.
+ */
+function streamTopicOf(event: DomainEvent): StreamTopic | undefined {
+  switch (event.type) {
+    case 'ticket.created': case 'ticket.resumed': case 'ticket.ended':
+    case 'assignment.started': case 'assignment.ended': return 'tickets'
+    case 'trigger.received': case 'decision.recorded': case 'eval.started':
+    case 'thread.subscribed': case 'thread.unsubscribed':
+    case 'trigger.requeued': case 'trigger.followup': return 'overview'
+    case 'policy.changed': return 'settings'
+    default: return undefined
+  }
+}
 /** Resolves a DSH session read within a couple of seconds, or fails loudly instead of leaving the panel loading forever. */
 async function bounded<T>(read: Promise<T>, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -141,6 +162,18 @@ export class Runtime extends Service implements SourceHost {
   readonly engine!: Engine
   readonly passes!: Passes
   readonly control!: Control
+  /**
+   * The Router panel's task list, read out of the Taskboard plugin's store. Built even while another process holds
+   * the state directory: it needs no state of its own, and the panel then keeps its list instead of losing it.
+   */
+  readonly tasks: TaskboardReader
+  /** The panel's live channel: every change a person can see is announced here instead of being polled for. */
+  readonly stream = new StreamHub()
+  /**
+   * The bounded log of failures a fixed code path recorded, and the one place a failure becomes a Router message.
+   * Set once the database is open; a host waiting for another process's lock has no log to write.
+   */
+  readonly failures!: FailureLog
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
@@ -164,6 +197,12 @@ export class Runtime extends Service implements SourceHost {
   constructor(ctx: Context, readonly machine: Machine, restart: () => void, lockPolicy: Partial<LockPolicy> = {}) {
     super(ctx, 'orchestrator')
     const runtime = this
+    // The Taskboard plugin's store is resolved on every refresh, so a board that the operator moves or that starts
+    // late is picked up without restarting this plugin; nothing here reads or writes dsh-superagent's own state.
+    // The service is unwrapped as `unknown` because this package has no dependency on the Taskboard package.
+    const taskboard = () => (ctx as unknown as { get(name: string): unknown }).get('taskboard')
+    this.tasks = new TaskboardReader(() => taskboardDatabase({
+      service: taskboard() as { config?: { databasePath?: unknown } } | undefined }))
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     // A predecessor killed a moment ago still holds its lock directory for the stale window, so the attempts wait it out:
     // giving up here used to throw out of the constructor, which left the plugin unmounted, every route 404, and the
@@ -221,12 +260,17 @@ export class Runtime extends Service implements SourceHost {
         closing: () => this.closing(), routerStopped: () => routerStopped(store),
         environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
+      // The failure log exists before the executor, which records into it, and pushes each record to every open panel.
+      const stream = this.stream
+      this.failures = new FailureLog({ store, routerMessage: (id, text) => { sessions.routerMessage(id, text) },
+        publish: record => { stream.publish('failures', record) } })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.holds(), environment, sourceLink: link,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+        repliedTo: trigger => repliedTo({ store, sources }, trigger), failures: this.failures,
+        stream: topic => { stream.publish(topic) } })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -250,6 +294,10 @@ export class Runtime extends Service implements SourceHost {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
+          // The panel's live channel: every domain event is a change a person can see, so each is announced once it
+          // commits. A rolled-back transaction announces nothing, which is why this waits for `afterCommit`.
+          const topic = streamTopicOf(event)
+          if (topic) store.afterCommit(() => { stream.publish(topic) })
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
@@ -266,6 +314,8 @@ export class Runtime extends Service implements SourceHost {
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         control: this.control,
+        // A worker's own failed/blocked report enters the failure log in the same transaction as the report itself.
+        get failures() { return runtime.failures },
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         titleOf: async (sessionId: string) => {
@@ -362,6 +412,20 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    // The live channel is its own route: a host that refuses it (or a test's web-server double) loses only push
+    // updates, and the panel falls back to its manual refresh instead of the plugin failing to mount.
+    try { this.disposers.push(registerStream(this.ctx, this)) }
+    catch (error) { this.ctx.logger.warn('dsh-superagent could not register its change stream: %s', String(error)) }
+    // The Taskboard provider publishes after its own committed writes. Follow its Cordis service lifetime.
+    const subscription = this.ctx.inject(['taskboard'], child => {
+      const service = (child as unknown as { get(name: string): unknown }).get('taskboard') as
+        { provider?: { subscribe(listener: () => void): () => void } } | undefined
+      const changed = () => { this.tasks.invalidate(); this.stream.publish('tasks') }
+      changed()
+      const release = service?.provider?.subscribe(changed)
+      return () => { release?.(); changed() }
+    })
+    this.disposers.push(() => { void subscription.dispose() })
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       // The Router conversation is the panel's way in, so it exists even while setup blocks dispatch.
@@ -383,7 +447,10 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
-      control: this.control,
+      control: this.control, tasks: this.tasks, stream: this.stream,
+      // Read through a getter on the runtime, not on this object: the log is built once the database is open, which a
+      // host awaiting another process's lock never reaches.
+      get failures() { return runtime.failures },
       // DSH's session calls queue behind a running turn; a bounded read keeps the panel from showing an endless spinner.
       listDshSessions: async () => bounded(this.ctx.sessionController.list({}, new AbortController().signal).then(listed => listed.items), 'the DSH session list'),
       /** The router conversation's last exchanges, so the panel can show it as the permanent chat it is. */
@@ -485,6 +552,8 @@ export class Runtime extends Service implements SourceHost {
       this.executor.dispose()
       this.sessions.dispose()
       for (const dispose of this.disposers.reverse()) dispose()
+      // Last, after the routes are unmounted: an open stream holds the listener open, so it ends before the host closes it.
+      this.stream.dispose()
       await this.ctx.sessionPersistence.flush()
     } finally {
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.

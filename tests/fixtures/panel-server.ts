@@ -6,6 +6,8 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { FailureRecord } from '../../src/app/failures.ts'
+import type { FailureRequest } from '../../src/app/api.ts'
 import type { DeleteReport, RouterSwitch } from '../../src/app/control.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
@@ -95,6 +97,10 @@ export interface PanelServer {
   pluginResults: ApiResponse<'GET plugin-search'>
   routerChat: ApiResponse<'GET router-chat'>
   routerSessions: ApiResponse<'GET router-sessions'>
+  /** The Router panel's task list, as `GET tasks` answers it; the rail polls this. */
+  tasks: ApiResponse<'GET tasks'>
+  /** The failure log the panel lists and the report route appends to, oldest first. */
+  failures: FailureRecord[]
   /** The Router's stop/start switch, as `GET state` reports it and the two control routes change it. */
   router: RouterSwitch
   /** Conversations the panel asked to delete, in order. */
@@ -271,6 +277,15 @@ function initial(): PanelServer {
     pluginResults: { entries: [], total: 0, nextOffset: null },
     routerChat: { sessionId: 'master', items: [] as { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] },
     routerSessions: { masterId: 'master', items: [] },
+    tasks: { available: true, detail: '', at: '2026-09-23T00:00:00Z', projects: [
+      { id: 'project-1', key: 'FIXTURE', name: 'Fixture project', tasks: [
+        { identifier: 'FIXTURE-2', title: '还没开始的那件', status: 'todo', priority: 'medium', updatedAt: '2026-09-22T00:00:00Z' },
+        { identifier: 'FIXTURE-1', title: '正在做的那件', status: 'in_progress', priority: 'high', updatedAt: '2026-09-23T00:00:00Z' },
+        { identifier: 'FIXTURE-3', title: '已做完的那件', status: 'done', priority: 'low', updatedAt: '2026-09-21T00:00:00Z' },
+      ] },
+      { id: 'project-2', key: 'OTHER', name: '另一个项目', tasks: [] },
+    ] },
+    failures: [],
     router: { paused: false, reason: '', at: '', by: 'panel' },
     deleted: [],
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
@@ -348,6 +363,26 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET router-chat': { query: ['limit'], answer: () => server.routerChat },
   'GET router-events': { answer: () => ({ counts: [{ type: 'user/message', count: 1 }] }) },
   'GET router-sessions': { answer: () => server.routerSessions },
+  'GET tasks': { query: ['project'], answer: ({ query }) => query.project
+    ? { ...server.tasks, projects: server.tasks.projects.filter(project => project.key === query.project) } : server.tasks },
+  'GET worker/failures': { query: ['ticket', 'kind', 'limit'], answer: ({ query }) => {
+    const shown = server.failures.filter(record => (query.ticket === undefined || record.ticketId === query.ticket)
+      && (query.kind === undefined || record.kind === query.kind))
+    // As the host does: newest first, and `total` counts every record the filter matched.
+    return { items: [...shown].reverse().slice(0, Number(query.limit ?? 50)), total: shown.length }
+  } },
+  'POST worker/failure': { body: true, answer: ({ body }) => {
+    const request = body as FailureRequest
+    const at = new Date()
+    const record: FailureRecord = { id: `failure-${server.failures.length + 1}`, at: at.toISOString(),
+      kind: request.kind ?? 'crash', source: request.source ?? 'api', detail: request.detail,
+      ...request.ticket === undefined ? {} : { ticketId: request.ticket },
+      ...request.session === undefined ? {} : { sessionId: request.session },
+      ...request.exitCode === undefined ? {} : { exitCode: request.exitCode } }
+    // The fixture has no dedupe window of its own; a case that wants one pre-seeds the same ticket/session/kind.
+    server.failures.push(record)
+    return { recorded: true as const, failure: record }
+  } },
   'GET router-event-sample': { query: ['type'], answer: () => ({ found: null }) },
   'POST router-chat': { body: true, answer: ({ body }) => {
     const text = (body as { text: string }).text
@@ -493,6 +528,7 @@ export function usePanelServer(cleanup: () => void) {
     sessionStorage.clear()
     server = initial()
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url === '/orchestrator/api/stream') return new Response(null, { status: 503 })
       if (server.down) return new Response(null, { status: 404 })
       const address = new URL(url, 'http://127.0.0.1:3082')
       const path = address.pathname.replace('/orchestrator/api/', '')

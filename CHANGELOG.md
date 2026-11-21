@@ -9,7 +9,29 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
-## [1.2.6] - 2026-11-21
+## [1.2.7] - 2026-11-21
+
+The Router's right-hand side now carries the Taskboard's task list: what each project has open, and what state every
+task is in. It is a read-only projection of the board another plugin owns.
+
+### Added
+
+- **A task-list rail beside the Router panel.** `GET tasks` answers every Taskboard project with its tasks — the
+  identifier, the title, the status, the priority and when it last changed — and the panel draws it as a collapsible
+  rail (280px, one column below 1080px) on the right of the management panel. A project selector and a refresh button
+  sit at the top with the time of the read; the summary counts `进行中 / 待审 / 阻塞`; each row carries a status badge
+  — todo grey, in progress blue, in review violet, blocked red, done green, canceled struck through — and finished
+  tasks are hidden until "显示已完成" is on. The list polls every 30 seconds, keeps its own switches across a panel
+  remount, and folds to a one-column tab that keeps its count.
+- **The route is read-only and never repairs the board.** Every poll opens `node:sqlite` with `readOnly: true` and
+  closes it in the same call, so it can neither write nor rewrite a WAL; the answer is cached for five seconds because
+  several tabs may poll at once. `?project=<key>` narrows the answer to one project by its key, ignoring case. The
+  board's location is the mounted Taskboard service's own `config.databasePath` when it can be read, then
+  `$DSH_HOME/taskboard.sqlite`, then `~/.dsh/taskboard.sqlite`, so a profile that pins an absolute path is followed
+  and dsh-superagent keeps no dependency on the Taskboard package.
+- **A board that is not there is a sentence, not an error.** A missing store, an unreadable file or a locked database
+  answers `available: false` with one line of detail: the rail shows it and the rest of the panel, including the
+  Router conversation, keeps working. No error toast, no thrown request.
 
 Operator control over the Router conversation: stop it, start it again, and delete the conversations this plugin owns.
 All three writes are audited, require the panel's same-origin request header, and live under `/orchestrator/api/`.

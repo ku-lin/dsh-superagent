@@ -5,6 +5,9 @@
 /* Disable sticky positioning inside DSH Plugin Manager, where the host container owns scrolling and bottom padding. */
 .dt-embedded .dt-savebar { position: static; }
 .dt-page > .dt-column { max-width: 960px; margin: 0 auto; padding-bottom: 48px; display: flex; flex-direction: column; gap: 24px; }
+/* The Router's task list sits beside the page column; the column keeps its own width so a wide window only widens the gap. */
+.dt-shell { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 24px; align-items: start; max-width: 1360px; margin: 0 auto; }
+.dt-shell > .dt-column { max-width: none; margin: 0; }
 .dt-head { position: relative; z-index: 3; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
 .dt-search { position: relative; width: 240px; max-width: 100%; }
 .dt-search-results { position: absolute; top: calc(100% + 6px); right: 0; width: min(560px, 90cqw); max-height: 60vh; overflow: auto; padding: 8px 16px; border: 0.5px solid var(--dsw-alias-border-l3); border-radius: 12px; background: var(--dsw-alias-bg-layer-2); box-shadow: var(--dsw-elevation-prominent); z-index: 5; display: flex; flex-direction: column; gap: 8px; }
@@ -433,3 +436,62 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dsr-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .dsr-row-open { flex: 1 1 auto; min-width: 0; }
 .dsr-delete { flex: 0 0 auto; }
+
+/* Router task list: a collapsible rail on the right of the management panel. */
+.dt-tasks { position: sticky; top: 0; display: flex; flex-direction: column; gap: 8px; min-width: 0; max-height: calc(100vh - 56px); overflow: auto; padding: 12px; border: 0.5px solid var(--dsw-alias-border-l3); border-radius: 14px; background: var(--dsw-alias-bg-layer-2); }
+.dt-tasks-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* The rail's own heading: the weight of a section title, but not that class — the rail is not one of the page's sections. */
+.dt-tasks-heading { display: flex; align-items: baseline; gap: 8px; margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
+.dt-tasks-heading-name { white-space: nowrap; }
+.dt-tasks-actions { display: flex; align-items: center; gap: 2px; }
+.dt-tasks-project { height: 28px; font-size: 12px; line-height: 18px; }
+.dt-tasks-summary { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); font-variant-numeric: tabular-nums; }
+.dt-tasks-status { font-size: 12px; line-height: 18px; }
+/* The disconnect is a state, not a spinner: it stays until the stream comes back. */
+.dt-tasks-offline { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-error, #c0392b); }
+/* The 异常 list: one row per recorded failure, with its kind, target, exit code and time on one line. */
+.dt-failures { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.dt-failures-row { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border: 1px solid var(--dsw-alias-border-secondary, #ddd); border-radius: 8px; }
+.dt-failures-row[data-kind="crash"] { border-color: var(--dsw-alias-label-error, #c0392b); }
+.dt-failures-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; line-height: 18px; }
+.dt-failures-kind { font-weight: 600; }
+.dt-failures-target { font-family: var(--dsw-alias-font-mono, monospace); color: var(--dsw-alias-label-secondary); }
+.dt-failures-exit { color: var(--dsw-alias-label-error, #c0392b); }
+.dt-failures-source { color: var(--dsw-alias-label-tertiary); }
+.dt-failures-ago { margin-left: auto; color: var(--dsw-alias-label-tertiary); }
+.dt-failures-detail { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); word-break: break-word; }
+.dt-tasks-groups { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.dt-tasks-group { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dt-tasks-group-name { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; line-height: 18px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
+.dt-tasks-list { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; }
+.dt-tasks-row { box-sizing: border-box; width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 6px; padding: 5px 6px; border: 0; border-radius: 8px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.dt-tasks-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dt-tasks-row:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -2px; }
+.dt-tasks-id { grid-column: 1; min-width: 0; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); font-family: var(--ds-font-family-code, Menlo, monospace); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dt-tasks-title { grid-column: 1; min-width: 0; font-size: 12px; line-height: 17px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.dt-task-badge { grid-column: 2; grid-row: 1 / span 2; align-self: center; padding: 1px 7px; border-radius: 999px; font-size: 10px; line-height: 15px; font-weight: 500; white-space: nowrap; }
+.dt-task-badge[data-status='backlog'] { color: var(--dsw-alias-label-caption); background: var(--dsw-alias-interactive-bg-hover); }
+.dt-task-badge[data-status='todo'] { color: var(--dsw-alias-label-secondary); background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 12%, transparent); }
+/* Blue and violet stay literal: `state-business-primary` follows the theme accent (this theme paints it violet,
+   which reads as "in review"), so the two hues a person tells apart at a glance are fixed. */
+.dt-task-badge[data-status='in_progress'] { color: var(--dsw-static-blue-500, #3b82f6); background: color-mix(in srgb, var(--dsw-static-blue-500, #3b82f6) 12%, transparent); }
+.dt-task-badge[data-status='in_review'] { color: var(--dsw-static-violet-500, #8b5cf6); background: color-mix(in srgb, var(--dsw-static-violet-500, #8b5cf6) 14%, transparent); }
+.dt-task-badge[data-status='blocked'] { color: var(--dsw-alias-state-error-primary); background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); }
+.dt-task-badge[data-status='done'] { color: var(--dsw-alias-state-success-primary); background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }
+.dt-task-badge[data-status='canceled'] { color: var(--dsw-alias-label-tertiary); background: transparent; text-decoration: line-through; }
+.dt-tasks-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; padding-top: 6px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.dt-tasks-switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); cursor: pointer; }
+.dt-tasks-switch input { margin: 0; accent-color: var(--dsw-alias-brand-primary); }
+.dt-tasks-stamp { font-size: 11px; }
+/* Collapsed: one vertical tab so the rail stays reachable without taking the column's width. */
+.dt-tasks-collapsed { align-items: center; padding: 8px 4px; }
+.dt-tasks-toggle { display: flex; flex-direction: row; align-items: center; gap: 4px; padding: 6px 2px; border: 0; border-radius: 8px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 12px; cursor: pointer; writing-mode: vertical-rl; }
+.dt-tasks-toggle:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dt-tasks-toggle .dt-count { writing-mode: vertical-rl; }
+@media (max-width: 1080px) {
+  .dt-shell { grid-template-columns: minmax(0, 1fr); }
+  .dt-tasks { position: static; max-height: none; }
+  .dt-tasks-collapsed { align-items: stretch; }
+  .dt-tasks-toggle { writing-mode: horizontal-tb; flex-direction: row; }
+  .dt-tasks-toggle .dt-count { writing-mode: horizontal-tb; }
+}

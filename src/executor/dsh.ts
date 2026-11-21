@@ -13,6 +13,8 @@ import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
+import { exitCodeOf, type FailureKind, type FailureLog } from '../app/failures.ts'
+import type { StreamTopic } from '../app/stream.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
@@ -112,6 +114,13 @@ export interface ExecutorHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
+  /**
+   * The deterministic failure log. Every path that ends a worker because of an error records here — never judged by a
+   * model — and the record reaches the Router through the same durable queue a report does.
+   */
+  readonly failures: Pick<FailureLog, 'record'>
+  /** Announces a change a panel refetches for; a host without a live channel simply has none. */
+  stream?(topic: StreamTopic): void
 }
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
@@ -350,7 +359,10 @@ export class DshExecutor implements Executor {
       .catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
         await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
-        throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
+        // The cause is kept, not flattened into the message: a prepare that ran out of time and one that exited
+        // non-zero stop the ticket for different reasons, and the failure log has to say which.
+        throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error })
       })
     await mkdir(directory, { recursive: true })
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
@@ -544,18 +556,45 @@ export class DshExecutor implements Executor {
     if (ticket.execution?.borrowedSession && !this.borrowedClaims.has(ticket.id)) return false
     return this.host.context.agents.get(executionSessionId(ticket) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
   }
-  /** Marks a ticket failed after its launch fails; the ticket waits until new human input or an explicit retry arrives. */
+  /**
+   * Marks a ticket failed after its launch fails; the ticket waits until new human input or an explicit retry arrives.
+   *
+   * The kind follows the failure itself: a prepare command that ran out of time is a `timeout` (`AbortSignal.timeout`
+   * rejects with a `TimeoutError`), a child process that exited non-zero is an `exit` carrying its code, and anything
+   * else is a `launch`. Choosing by the error rather than by the call site is what keeps a wrapper's `exit code: 3`
+   * readable in the log.
+   */
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
-    this.failed(ticketId, String(error))
+    // A wrapped prepare failure is judged by its cause: `AbortSignal.timeout` rejects with a `TimeoutError`, a child
+    // process that exited non-zero reports its code, and anything else is a plain launch failure.
+    const cause = error instanceof Error && error.cause !== undefined ? error.cause : error
+    const name = cause instanceof Error ? cause.name : ''
+    const code = exitCodeOf(cause) ?? exitCodeOf(error)
+    const kind: FailureKind = name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : code === undefined ? 'launch' : 'exit'
+    this.failed(ticketId, String(error), kind)
   }
-  /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
-  private failed(ticketId: string, summary: string): void {
+  /**
+   * Records a `failed` report on the ticket, relays it to the main Session, and records the failure in the log — all in
+   * one transaction, so a report a person never sees is not recorded as an alert either.
+   * @param ticketId - the ticket whose worker failed.
+   * @param summary - the failure as the path that saw it described it.
+   * @param kind - which code path saw it; the log's dedupe window is per ticket, session and kind.
+   */
+  private failed(ticketId: string, summary: string, kind: FailureKind = 'report-failed'): void {
+    const code = exitCodeOf(summary)
     this.host.store.atomic(() => {
       const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
+      // The report's relay is queued first and the failure alert right after, both inside this transaction: what the
+      // main Session reads first is unchanged by this feature, and a rollback drops both.
       this.relay(resultRelay(updated, 'failed', summary))
+      // The alert is recorded inline rather than after the commit, so it is queued in the same transaction as the
+      // report it describes; `FailureLog.record` joins the caller's transaction for exactly this reason.
+      this.host.failures.record({ kind, source: 'executor', detail: summary, ticketId,
+        sessionId: executionSessionId(updated), ...code === undefined ? {} : { exitCode: code } })
     })
+    this.host.stream?.('tickets')
   }
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
@@ -655,8 +694,43 @@ export class DshExecutor implements Executor {
         this.borrowedClaims.set(ticketId, agent.session.snapshotEvents().length)
     }))
     // The Inputs a message of dsh-superagent's carries, which its worker reads once the Session took the message into its
-    // history: a step that claimed it may be cancelled or fail before, which drops it.
+    // history: a step that claimed it may be cancelled or fail before, which drops it. The same subscription carries the
+    // other end: a turn the host closed with reason `error` is a failure of the ticket that turn worked.
     this.disposers.push(ctx.on('session/event', (session, event) => {
+      if (event.type === 'turn/end') {
+        if (event.data.reason.kind !== 'error' || this.host.closing()) return
+        const ticketId = this.host.store.tickets.open().find(ticket => executionSessionId(ticket) === session.id)?.id
+        if (ticketId === undefined) return
+        const failure = event.data.reason.error
+        void this.background(Promise.resolve().then(() => {
+          this.host.failures.record({ kind: 'turn-error', source: 'session',
+            detail: `${failure.message}${failure.code ? ` (${failure.code})` : ''} — turn ${event.data.turn} of ${session.id} ended in error`,
+            ticketId, sessionId: session.id })
+          this.host.stream?.('tickets')
+        }))
+        return
+      }
+      // A background job that broke is a process-level failure of the ticket whose worker started it. `dsh-jobs`
+      // records the settlement in the Session log with the producer's own terminal detail, which is where a shell
+      // command's `exit code: N` is spelled; `killed` is a stop this plugin asked for, so it is not a failure.
+      //
+      // Read structurally: the event's declaration merge comes from `@deepseek-ai/dsh-jobs`, which this package does
+      // not depend on, so the payload is described here rather than imported.
+      const settled = event.type as string === 'job/settled'
+        ? (event as unknown as { data: { status: string; detail?: string; label?: string; jobId: string } }).data : undefined
+      if (settled) {
+        if (settled.status !== 'failed' || this.host.closing()) return
+        const ticketId = this.host.store.tickets.open().find(ticket => executionSessionId(ticket) === session.id)?.id
+        if (ticketId === undefined) return
+        const code = exitCodeOf(settled.detail)
+        void this.background(Promise.resolve().then(() => {
+          this.host.failures.record({ kind: code === undefined ? 'crash' : 'exit', source: 'session',
+            detail: `${settled.label || settled.jobId} failed${settled.detail ? `: ${settled.detail}` : ''}`,
+            ticketId, sessionId: session.id, ...code === undefined ? {} : { exitCode: code } })
+          this.host.stream?.('tickets')
+        }))
+        return
+      }
       const ticketId = this.host.store.tickets.open().find(ticket => executionSessionId(ticket) === session.id)?.id
       if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
       const message = event.data
@@ -672,7 +746,27 @@ export class DshExecutor implements Executor {
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()
         || (ticket.execution?.borrowedSession && !this.borrowedClaims.has(ticket.id))) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
+      // A failure no retry covers: the kind follows the error, and the session is the one that raised it.
+      const code = exitCodeOf(error)
+      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error),
+        code === undefined ? 'agent-error' : 'exit') }))
+    }))
+    // A worker conversation that ends because of an error stops its ticket even when the error never reached
+    // `agent/error`: DSH emits `agent/disposed` after quiescence, which is the last moment the assignment's own
+    // session is still named. A disposed worker whose ticket still had a running assignment stopped without a report.
+    this.disposers.push(ctx.on('agent/disposed', ({ agent }) => {
+      if (this.host.closing()) return
+      const ticket = this.ticketOf(agent)
+      const assignment = ticket && runningAssignment(ticket)
+      if (!ticket || !assignment || !liveTicket(ticket) || assignment.report) return
+      const status = agent.status
+      // A disposed worker that was mid-turn broke; one that was idle was disposed by something other than its work.
+      void this.background(Promise.resolve().then(() => {
+        this.host.failures.record({ kind: status === 'running' ? 'crash' : 'agent-error', source: 'session',
+          detail: `Worker conversation ${agent.id} was disposed while assignment ${assignment.id} was running (status: ${status})`,
+          ticketId: ticket.id, sessionId: agent.id, assignmentId: assignment.id })
+        this.host.stream?.('tickets')
+      }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */

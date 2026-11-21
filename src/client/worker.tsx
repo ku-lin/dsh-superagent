@@ -1,10 +1,13 @@
-/** Explicit ticket/session borrowing and read-only plugin discovery. */
-import { useState } from 'react'
+/** Explicit ticket/session borrowing, the failure list, and read-only plugin discovery. */
+import { useCallback, useEffect, useState } from 'react'
 import { usePoll } from './api.ts'
 import type { ApiResponse } from '../app/api.ts'
+import type { FailureRecord } from '../app/failures.ts'
+import type { DshSuperagentKey } from './locales.ts'
 import { Button, Icon } from './controls.tsx'
+import { useLive } from './live.ts'
 import { usePanel } from './provider.tsx'
-import { errorText } from './text.ts'
+import { errorText, valueLabel, when } from './text.ts'
 import { ConfirmButton, Hint, Section } from './widgets.tsx'
 
 const label = (value: string | Record<string, string> | undefined, lang: string): string =>
@@ -12,6 +15,45 @@ const label = (value: string | Record<string, string> | undefined, lang: string)
 /** The Router's replies arrive as Markdown; the panel shows them as plain text, so the syntax marks are dropped. */
 const plain = (text: string): string => text.replace(/\*\*/g, '').replace(/`/g, '')
 const folderName = (path: string | undefined): string => path?.split(/[\\/]/).filter(Boolean).at(-1) ?? ''
+
+/**
+ * The 异常 list: every failure a fixed code path recorded, newest first.
+ *
+ * It reads `GET worker/failures` on mount, whenever the host announces a new record, and when the person asks — never on
+ * a timer. The route is the authority; the pushed record only saves the refetch when the list is already on screen.
+ */
+function FailureRail() {
+  const { t, call } = usePanel()
+  const live = useLive()
+  const [items, setItems] = useState<readonly FailureRecord[]>([])
+  const [error, setError] = useState<Error>()
+  const load = useCallback(async () => {
+    try { setItems((await call('GET worker/failures', { query: { limit: 50 } })).items); setError(undefined) }
+    catch (failure) { setError(failure instanceof Error ? failure : new Error(String(failure))) }
+  }, [call])
+  // A pushed record carries the newest fact itself, so it leads the list before the refetch answers.
+  const pushed = live.failures[0]
+  const announced = live.revisions['failures'] ?? 0
+  useEffect(() => { void load() }, [load, announced, live.generation])
+  const shown = pushed && !items.some(item => item.id === pushed.id)
+    ? [pushed as unknown as FailureRecord, ...items] : items
+  return <Section title={t('failuresTitle')} icon="alert" count={shown.length || undefined}>
+    <Hint>{t('failuresHint')}</Hint>
+    {live.offline && <p className="dt-error" role="status">{t('tasksOffline')}</p>}
+    {error && <p className="dt-error" role="alert">{t('failuresLoadFailed')}</p>}
+    {shown.length ? <ul className="dt-failures">{shown.map(record => <li key={record.id} className="dt-failures-row" data-kind={record.kind}>
+      <div className="dt-failures-head">
+        <span className="dt-failures-kind">{valueLabel(t, 'failureKind', record.kind)}</span>
+        {(record.ticketId || record.sessionId) && <span className="dt-failures-target">{record.ticketId ?? record.sessionId}</span>}
+        {record.exitCode !== undefined && <span className="dt-failures-exit">{t('failuresExit', { code: String(record.exitCode) })}</span>}
+        <span className="dt-failures-source">{valueLabel(t, 'failureSource', record.source)}</span>
+        <span className="dt-failures-ago">{when(record.at, t('lang'))}</span>
+      </div>
+      <div className="dt-failures-detail" title={record.detail}>{record.detail}</div>
+    </li>)}</ul> : (!error && !live.offline && <Hint>{t('failuresEmpty')}</Hint>)}
+  </Section>
+}
+
 
 export function WorkerPanel() {
   const { t, call, openSession, navigate } = usePanel()
@@ -124,5 +166,6 @@ export function WorkerPanel() {
         </li>)}</ul> : <Hint>{sessions.error ? t('workerLoadFailed') : sessions.data ? t('workerNoSessions') : t('loading')}</Hint>}
       </aside>
     </div>
+    <FailureRail />
   </Section>
 }
