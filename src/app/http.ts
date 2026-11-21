@@ -7,10 +7,14 @@ import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteP
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import { latestAssignment, liveTicket } from '../core/index.ts'
+import type { RouterSessionRow } from './router-sessions.ts'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
+import type { Control } from './control.ts'
+import { ControlError } from './control.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
+import { lockPath, type LockRefusal } from './state-lock.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
@@ -33,6 +37,8 @@ export interface HttpHost {
   readonly store: Store
   /** Read-only DSH catalog; resolving a selected agent does not initialize a worker preset. */
   listDshSessions(): Promise<readonly SessionSummary[]>
+  /** Router-level Sessions only, from the durable headers: the virtual Router workspace's whole data source. */
+  routerSessions(): Promise<{ masterId: string; items: RouterSessionRow[] }>
   /** The router conversation's last exchanges (newest last). */
   routerChat(limit: number): Promise<{ sessionId: string; items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] }>
   /** Delivers one message into the router conversation. */
@@ -53,6 +59,8 @@ export interface HttpHost {
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount' | 'bindingInProgress'>
+  /** The Router switch and the deletion of the conversations this plugin owns (`HTTP` route `router/*`, `sessions/:id`). */
+  readonly control: Control
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -100,6 +108,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError) return [error.status, { error: error.message }]
+  if (error instanceof ControlError) return [error.status, { error: error.message, code: error.code }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
@@ -118,10 +127,12 @@ function setupView(runtime: HttpHost) {
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
-  const settings = runtime.store.settings()
+  const settings = runtime.store.settings(), router = runtime.control.router
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    // The Router's own switch is separate from `paused`: stopping the Router never stops Tickets or their workers.
+    router: { paused: router.paused, reason: router.reason, at: router.at, by: router.by } }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -218,6 +229,7 @@ function routes(runtime: HttpHost): Routes {
     },
     'GET router-events': () => runtime.routerEventTypes(),
     'GET router-event-sample': ({ query }) => runtime.routerEventSample(query.type ?? 'user/message'),
+    'GET router-sessions': () => runtime.routerSessions(),
     'GET router-chat': async ({ query }) => {
       const limit = Math.min(Math.max(Number(query.limit ?? 40) || 40, 1), 200)
       return runtime.routerChat(limit)
@@ -225,6 +237,21 @@ function routes(runtime: HttpHost): Routes {
     'POST router-chat': async ({ body }) => {
       const { text } = z.object({ text: z.string().trim().min(1).max(8000) }).strict().parse(await body())
       return runtime.routerSend(text)
+    },
+    /** Stop the Router: its conversation keeps everything it has, and every further message waits in the durable queue. */
+    'POST router/stop': async ({ body }) => {
+      const { reason } = z.object({ reason: z.string().max(500).default('') }).strict().parse(await body())
+      return runtime.control.stopRouter(reason, 'panel')
+    },
+    /** Start the Router again: what the stop held is handed over in arrival order. */
+    'POST router/start': () => runtime.control.startRouter('panel'),
+    /**
+     * Delete one worker or router-level conversation. `confirm=true` is required; the permanent Router conversation, and
+     * any conversation this plugin does not own, are refused.
+     */
+    'DELETE sessions/:id': async ({ params, query }) => {
+      const confirm = z.enum(['true', 'false']).catch('false').parse(query.confirm) === 'true'
+      return runtime.control.deleteSession(params.id, confirm, 'panel')
     },
     'GET dsh-sessions': async () => {
       const leases = new Map(store.tickets.open().flatMap(ticket => ticket.execution?.borrowedSession
@@ -325,6 +352,40 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
       } catch (error) { json(res, ...failure(error)) }
+    } })]
+  return () => { for (const dispose of disposers) dispose() }
+}
+/** What a process waiting for the state directory's lock answers with: the lock it could not take and the health it reports. */
+export interface LockWaitView {
+  readonly refusal: LockRefusal
+  readonly machine: Machine
+  health(): Record<string, Health>
+}
+/**
+ * Serves the management API while another process holds the state directory. Every request answers 503 with the
+ * `runtime` health entry and the lock's holder trace, so the panel says why it is stopped instead of showing the 404s
+ * of routes that were never mounted.
+ */
+export function registerLockWaitHttp(ctx: Context, wait: LockWaitView): () => void {
+  if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
+  // Read per request: the health board keeps the sentence, and how long the lock has been held changes while it lasts.
+  const waiting = () => {
+    const health = wait.health()
+    const runtime = health['runtime']
+    return {
+      error: runtime?.detail || `dsh-superagent is waiting for the state directory lock ${lockPath(wait.machine.stateDir)}`,
+      code: runtime?.code ?? 'lockWait',
+      lock: { path: lockPath(wait.machine.stateDir), attempts: wait.refusal.attempts, waitedMs: wait.refusal.waitedMs,
+        holder: wait.refusal.holder ?? null },
+      health,
+    }
+  }
+  const disposers = [
+    ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
+      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      json(res, 503, waiting())
     } })]
   return () => { for (const dispose of disposers) dispose() }
 }

@@ -32,6 +32,9 @@ your pull request which of the two you are changing.
   breaking change and must appear in `CHANGELOG.md`.
 - **Tests do not reach the network.** The suite uses fixtures; a test that needs a
   real GitHub account, a real bot or a real repository does not go in `tests/`.
+- **Both READMEs move together.** `README.md` is English and `README.zh-CN.md` is Chinese; each
+  links to the other, and the version line at the top of both must match `package.json`. A
+  change to one that leaves the other stale is a defect.
 - **Documented behavior is what is true.** If something is planned or unverified,
   the README says so.
 

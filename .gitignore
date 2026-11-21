@@ -1,31 +1,5 @@
-# Dependencies
 node_modules/
-
-# Build output (shipped through package.json "files" after `pnpm build`)
 lib/
-*.tsbuildinfo
-
-# Runtime data: state directory, logs, control files, sqlite + WAL
 .artifacts/
-state/
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
-
-# Test output
-coverage/
-
-# Local secrets and configuration
 .env
-.env.*
-!.env.example
-*.local
-*.pem
-*.key
-credential*.json
-
-# Editor and OS noise
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+coverage/

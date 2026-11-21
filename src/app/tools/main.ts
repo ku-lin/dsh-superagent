@@ -9,6 +9,8 @@ import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssess
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import { ControlError, type Control } from '../control.ts'
+import { sessionLink } from '../session-link.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import type { Store } from '../store.ts'
@@ -22,8 +24,10 @@ export interface MainToolsHost {
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt' | 'routerMessage'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
+  /** The Router switch and conversation deletion (`orchestrator_router_*`, `orchestrator_session_delete`). */
+  readonly control: Pick<Control, 'router' | 'stopRouter' | 'startRouter' | 'deleteSession' | 'sessionKind'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
@@ -127,7 +131,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route candidates in one call, one item each by the card\'s trigger_id: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate, as dispatch says. Items run in order, each answered alone; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }) => {
       const decided = new Map<string, string>()
@@ -191,7 +195,7 @@ function answerAfter(agent: Agent, from: number): string {
  * This is the inter-session conversation the Router runs on: no polling, no timer of its own, and the answer waits in the
  * Router's inbox like any other message a person or a source sends it.
  */
-async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, from: number, title: string,
+async function answerLater(host: MainToolsHost, _router: Agent, worker: Agent, from: number, title: string,
   signal: AbortSignal): Promise<void> {
   const idle = (): boolean => worker.status === 'idle'
   if (!idle()) {
@@ -203,14 +207,24 @@ async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, fr
   if (signal.aborted) return
   const reply = answerAfter(worker, from)
   if (!reply) return
-  await host.sessions.prompt(router.id, key('worker-answer', worker.id, String(Date.now())),
-    `Answer from ${title}:\n${reply}`, 'queue').catch(() => { /* The Router's own turn may refuse it; the text stays in the worker. */ })
+  // Through the Router's own delivery queue, so a stopped Router holds the answer instead of being woken by it.
+  host.sessions.routerMessage(key('worker-answer', worker.id, String(Date.now())), `Answer from ${title}:\n${reply}`)
 }
 /** Resolves when the conversation's turn ends, or false on timeout or when the caller is cancelled. */
 async function untilIdle(agent: Agent, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
   const wait = (ms: number) => new Promise<boolean>(resolve => { setTimeout(() => resolve(false), ms) })
   const cancelled = new Promise<boolean>(resolve => { signal.addEventListener('abort', () => resolve(false), { once: true }) })
   return await Promise.race([agent.whenIdle().then(() => true), wait(timeoutMs), cancelled])
+}
+/**
+ * The Router's own switch as a tool answer: the state a person reads, refused as a refusal when it cannot change.
+ * A control refusal is the model's to report, not an exception that fails the whole turn.
+ */
+function switched(host: MainToolsHost, run: () => { paused: boolean; reason: string; at: string }) {
+  try { return { router: run(), reason: '' } } catch (error) {
+    if (error instanceof ControlError) return { router: host.control.router, refused: error.message, code: error.code }
+    throw error
+  }
 }
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -282,7 +296,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
+      description: `Send an answer to a human question, a ready result, or attention needing human action, as the replies section says; the gate refuses the rest, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed, merged or dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
         ticket_id: z.string().optional(),
@@ -366,7 +380,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const tickets = host.store.tickets.open()
         const claimed = new Map(tickets.flatMap(ticket => ticket.execution?.borrowedSession
           ? [[ticket.execution.borrowedSession.sessionId, ticket] as const] : []))
-        const items: { title: string; running: boolean; available: boolean; ticket?: string; session: string }[] = []
+        const items: { title: string; running: boolean; available: boolean; ticket?: string; session: string; link: string }[] = []
         for (const item of listed.items) {
           if (item.sessionId === agent.id) continue
           // Answer with the conversation's title, never its id: a person reading this chat should not have to parse ids.
@@ -376,7 +390,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           if (!title) title = await host.titleOf(item.sessionId).catch(() => '')
           const ticket = claimed.get(item.sessionId)
           items.push({ title, running: item.running, available: item.agentAvailable,
-            ...(ticket ? { ticket: ticket.title } : {}), session: item.sessionId })
+            ...(ticket ? { ticket: ticket.title } : {}), session: item.sessionId, link: sessionLink(item.sessionId, title) })
         }
         return { items }
       },
@@ -405,11 +419,39 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         // wants the answer inline.
         if (args.wait_seconds === 0) {
           void answerLater(host, agent, worker, from, title, signal)
-          return { session: sessionId, title, delivered: true, finished: false }
+          return { session: sessionId, title, link: sessionLink(sessionId, title), delivered: true, finished: false }
         }
         const finished = await untilIdle(worker, args.wait_seconds * 1000, signal)
         const reply = answerAfter(worker, from)
-        return { session: sessionId, title, delivered: true, finished, ...(reply ? { reply } : {}) }
+        return { session: sessionId, title, link: sessionLink(sessionId, title), delivered: true, finished, ...(reply ? { reply } : {}) }
+      },
+    }),
+    tool({
+      name: 'orchestrator_router_stop',
+      description: 'Stop the Router conversation on an explicit human request: it keeps its history and identity, while later messages bound for it wait until the Router starts again. Running tickets and workers are unaffected.',
+      schema: z.object({
+        reason: z.string().trim().max(500).default('').describe('Why, in the operator\'s words; shown in the panel\'s state.'),
+      }).strict(),
+      execute: async args => switched(host, () => host.control.stopRouter(args.reason, 'tool')),
+    }),
+    tool({
+      name: 'orchestrator_router_start',
+      description: 'Start the Router conversation again on an explicit human request: messages the stop held are handed over in the order they arrived.',
+      schema: z.object({}).strict(),
+      execute: async () => switched(host, () => host.control.startRouter('tool')),
+    }),
+    tool({
+      name: 'orchestrator_session_delete',
+      description: 'Delete one conversation this Router owns on an explicit human request: a worker or router-level one. The person\'s own conversations are refused and the Router cannot delete itself. It stops and leaves the lists; its log is reported as removed or retained.',
+      schema: z.object({
+        session: z.string().min(1).describe('The conversation\'s session id, as orchestrator_worker_list reports it.'),
+        confirm: z.literal(true).describe('Repeat the intent: a deletion requires true.'),
+      }).strict(),
+      execute: async args => {
+        try { return await host.control.deleteSession(args.session, args.confirm, 'tool') } catch (error) {
+          if (error instanceof ControlError) return { refused: error.message, code: error.code, session: args.session }
+          throw error
+        }
       },
     }),
   ]

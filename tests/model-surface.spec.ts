@@ -34,14 +34,20 @@ type Section = (context: { signal?: AbortSignal }) => string
 interface Skill { name: string; description: string; content: string }
 
 /**
- * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
- * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
+ * Maximum combined character count of system prompt and tool definitions per role: a guard against unbounded growth,
+ * not a byte-level specification. Lower it when shrinking model-facing text; raise it only intentionally, and say why.
+ *
+ * Raised 59_000 -> 61_000 for 1.2.6-sync.1: 1.2.4–1.2.6 added three orchestrator tools
+ * (orchestrator_router_stop, orchestrator_router_start, orchestrator_session_delete) whose JSON definitions come to
+ * about 1_725 characters, so the model-facing surface legitimately grew. The four longest descriptions were tightened
+ * at the same time (route 466->425, reply 372->355, router_stop 252->219, session_delete 335->302); the rest of the
+ * growth is the feature itself, not padding, and the tools were kept rather than merged or dropped.
  */
-const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 40_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 61_000, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
-const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts', RUNTIME = 'src/app/runtime.ts'
+const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts'
 /** Regex patterns compiled from `orchestrator_read` resource templates (`<…>` matches one path segment; `…` matches the rest). */
 const RESOURCE_NAMES = RESOURCES.map(({ name }) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/<[^>]+>/g, '[^/\\s]+').replace('…', '.+')}$`))
 /** Report and assignment states, which text names as such; a ticket or a worker is in one of the card states (TICKET_STATES). */
@@ -262,11 +268,11 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
-    // Most inputs are JSON cards; the router's opening greeting is plain text, and it is model-facing copy too, so it is
-    // audited rather than skipped.
-    const card = ((): Record<string, unknown> | undefined => { try { return JSON.parse(text) as Record<string, unknown> } catch { return undefined } })()
-    if (!card) { surfaces.push({ where: 'orchestrator input greeting', owner: RUNTIME, role: 'orchestrator', text }); continue }
-    const value = card
+    if (!text.trimStart().startsWith('{')) {
+      surfaces.push({ where: 'orchestrator plain-text input', owner: 'src/app/runtime.ts', role: 'orchestrator', text })
+      continue
+    }
+    const value = JSON.parse(text) as Record<string, unknown>
     const kind = String(value.kind ?? Object.keys(value)[0])
     const owner = kind === 'candidate' ? LINKS : kind === 'worker_attention' ? TOOLS : kind === 'worker_report' ? EXECUTOR : NOTICES
     surfaces.push({ where: `orchestrator input ${kind}`, owner, role: 'orchestrator', text })

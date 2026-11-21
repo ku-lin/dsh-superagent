@@ -6,6 +6,7 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
+import type { AuditEntry, RouterSwitch } from './app/control.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -29,8 +30,10 @@ export const KV = {
   prompts: { revision: record<number>('prompt-revision'), version: family<PromptVersion, [revision: number]>('prompt-version:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
-  /** Runtime: the main Session's ID, and the main Session that already got its opening message. */
-  runtime: { masterId: record<string>('master-id'), greeted: record<string>('master-greeted') },
+  /** Runtime: the main Session's ID, the main Session that already got its opening message, the Router switch, and the
+   * audit trail of the panel's own write operations. */
+  runtime: { masterId: record<string>('master-id'), greeted: record<string>('master-greeted'),
+    router: record<RouterSwitch>('router-switch'), audit: record<AuditEntry[]>('audit') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

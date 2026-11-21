@@ -404,12 +404,15 @@ it('relays a worker\'s report with its ticket card and the start of its summary,
   await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'Needs a decision.', human_action: 'Desktop too?' })
   await h.runtime.idle()
   expect(relaysOf('worker_attention').at(-1)).toEqual({ kind: 'worker_attention', state: 'progress', read: `ticket/${ticket.id}/result`,
+    worker: { session: `worker-${ticket.id}`, title: expect.stringContaining('worker-'),
+      link: expect.stringMatching(/^\[worker-[^\]]*\]\(dsh:\/\/session\/worker-/) },
     ticket: expect.objectContaining({ ticket_id: ticket.id, state: 'person/answer', attention: expect.objectContaining({ question: 'Desktop too?' }) }) })
   const summary = 'Done. ' + 'Evidence. '.repeat(100)
   await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary, human_action: null })
   await h.runtime.idle()
   const report = relaysOf('worker_report').at(-1)!
   expect(report).toMatchObject({ ticket: { ticket_id: ticket.id, title: ticket.title }, trigger_id: trigger.id, state: 'ready', chars: summary.length,
+    worker: { session: expect.stringContaining('worker-'), title: expect.stringContaining('worker-'), link: expect.stringContaining('dsh://session/') },
     read: `ticket/${ticket.id}/result` })
   expect(String(report.summary)).toBe(summary.slice(0, 600))
   expect(report.ticket).not.toHaveProperty('preview')

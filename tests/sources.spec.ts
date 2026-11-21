@@ -1090,9 +1090,9 @@ describe('feishu event consumer', () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
     const { ctx, store } = consumerSource(cli('events'))
-    // A malformed line reports an error from stdout, while "[event] ready" arrives on stderr; the two streams are
-    // not ordered against each other, so the surviving health entry is whichever was processed last. Record every
-    // report and assert the error was reported, instead of reading the last one.
+    // A malformed line reports an error from stdout, while "[event] ready" arrives on stderr; the two streams are not
+    // ordered against each other, so the surviving health entry is whichever was processed last. Record every report and
+    // assert the error was reported, instead of reading the last one.
     const reported: { state: string; detail?: unknown }[] = []
     const report = ctx.report
     Object.defineProperty(ctx, 'report', { value: (entry: string, value: Parameters<typeof report>[1]) => { reported.push(value); report(entry, value) } })

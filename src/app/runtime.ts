@@ -14,7 +14,6 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { lockSync } from 'proper-lockfile'
 import { sameDirectory } from '../infra/environment.ts'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
@@ -32,7 +31,10 @@ import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
-import { registerHttp, type HttpHost } from './http.ts'
+import { registerHttp, registerLockWaitHttp, type HttpHost } from './http.ts'
+import { Control, routerStopped, sessionRoot } from './control.ts'
+import { acquireStateLock, describeLock, lockPath, type LockAttempt, type LockPolicy, type LockRefusal } from './state-lock.ts'
+import { selectRouterSessions } from './router-sessions.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -65,48 +67,125 @@ async function bounded<T>(read: Promise<T>, what: string): Promise<T> {
 const ROUTER_GREETING = '这是 dsh-superagent 的常驻 Router 对话。直接说「列出所有 worker」看它在指挥哪些对话，或说「让 <对话标题> 去做 <事情>」把指令发给某个 worker。'
 /** Its sidebar title: fixed, so the permanent conversation is recognizable and does not take a title from its first message. */
 const ROUTER_TITLE = 'Router（常驻）'
+/** Why nothing that needs the database can answer while another process holds the state directory. */
+const lockWaitError = (directory: string): Error =>
+  new Error(`dsh-superagent is waiting for the state directory lock ${lockPath(directory)}; another process holds it`)
+/** The holder's trace as a log line: a lock directory's last refresh is all another process can see of its holder. */
+function holderText(refusal: LockRefusal): string {
+  const { holder } = refusal
+  if (!holder) return 'no lock directory was there'
+  const age = holder.ageMs === undefined ? 'at an unknown time' : `${(holder.ageMs / 1000).toFixed(1)} s ago`
+  return `its lock directory was last refreshed ${age}${holder.refreshedAt ? `, at ${holder.refreshedAt}` : ''}`
+}
+/** The `runtime` health entry of a state directory this process could not lock: another process holds it, or it cannot be used at all. */
+function lockHealth(refusal: LockRefusal, directory: string): Health {
+  const held = (refusal.error as NodeJS.ErrnoException).code === 'ELOCKED'
+  const age = refusal.holder?.ageMs
+  const values = { path: lockPath(directory), age: age === undefined ? 'unknown' : `${(age / 1000).toFixed(1)} s`,
+    error: refusal.error.message.split('\n')[0] ?? refusal.error.message }
+  return { ...health(held ? 'starting' : 'error', held ? 'lockWait' : 'lockError', values), at: now() }
+}
+/** Creates the state directory and takes its lock, reporting a directory that cannot be created like a lock that is held. */
+function stateLock(directory: string, policy: Partial<LockPolicy>, onCompromised: (error: Error) => void): LockAttempt {
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    return acquireStateLock(directory, { ...policy, onCompromised })
+  } catch (error) {
+    const holder = describeLock(directory)
+    return { refusal: { error: error instanceof Error ? error : new Error(String(error)), attempts: 0, waitedMs: 0, ...holder ? { holder } : {} } }
+  }
+}
+/**
+ * The context a Source kind gets while another process holds the state directory: its kind registers its health entries,
+ * and nothing is read, written or polled, so the Source's plugin entry stays mounted and quiet.
+ */
+function waitingContext(directory: string): SourceContext {
+  const missing = (): never => { throw lockWaitError(directory) }
+  return {
+    get deployment() { return missing() },
+    commands: new Commands(missing, {}, AbortSignal.abort()),
+    ready: Promise.resolve(),
+    configured: () => false,
+    config: () => undefined,
+    receive: missing,
+    atomic: missing,
+    state: { get: missing, set: missing, keys: missing },
+    threads: { get: missing, subscribed: missing, describe: missing, patch: missing },
+    tickets: { get: missing, open: missing, bindThread: missing, threadClosed: missing },
+    triggers: { get: missing, latest: missing },
+    notify: () => {},
+    report: () => {},
+  }
+}
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
  * Exposes the `SourceHost` service on the Cordis context for source plugins and coordinates startup, setup checks, HTTP route registration, and graceful shutdown.
- * Locks the state directory before opening SQLite so concurrent processes cannot corrupt or double-migrate state.
+ * Locks the state directory before opening SQLite so concurrent processes cannot corrupt or double-migrate state; a lock
+ * another process holds leaves the parts below unbuilt and the Runtime reporting `lockWait` instead of failing to mount.
  */
 export class Runtime extends Service implements SourceHost {
-  readonly store: Store
-  readonly setup: Setup
-  readonly prompts: Prompts
-  readonly effects: Effects
-  readonly sources: SourceRegistry
-  readonly commands: Commands
-  readonly sessions: Sessions
-  readonly settings: Settings
-  readonly executor: DshExecutor
-  readonly assessor: MasterAssessor
-  readonly outbox: Outbox
-  readonly engine: Engine
-  readonly passes: Passes
+  // Built once this process holds the state directory. They stay unset while another process holds it (`lockWait` below),
+  // which is why every entry point that can run in that state answers the wait rather than reaching for them.
+  readonly store!: Store
+  readonly setup!: Setup
+  readonly prompts!: Prompts
+  readonly effects!: Effects
+  readonly sources!: SourceRegistry
+  readonly commands!: Commands
+  readonly sessions!: Sessions
+  readonly settings!: Settings
+  readonly executor!: DshExecutor
+  readonly assessor!: MasterAssessor
+  readonly outbox!: Outbox
+  readonly engine!: Engine
+  readonly passes!: Passes
+  readonly control!: Control
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
-  masterId: string
+  /** The lock that could not be taken, when another process holds this machine's state directory. */
+  readonly lockWait?: LockRefusal
+  masterId!: string
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
   private readonly disposers: (() => void)[] = []
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private stopping?: Promise<void>
-  private readonly sourceDeps: SourceContextDeps
-  private readonly toolHost: MainToolsHost & ExecutorToolsHost
+  private readonly sourceDeps!: SourceContextDeps
+  private readonly toolHost!: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
+  /**
+   * @param lockPolicy - the lock's stale window and attempts; a start waits about ten seconds by default, which covers
+   *   the lock directory a killed predecessor leaves behind without holding up the host's own boot.
+   */
+  constructor(ctx: Context, readonly machine: Machine, restart: () => void, lockPolicy: Partial<LockPolicy> = {}) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
-    mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
+    // A predecessor killed a moment ago still holds its lock directory for the stale window, so the attempts wait it out:
+    // giving up here used to throw out of the constructor, which left the plugin unmounted, every route 404, and the
+    // panel saying dsh-superagent did not respond.
     const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
-    const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
-    this.releaseLock = async () => { release() }
+    const attempt = stateLock(machine.stateDir, lockPolicy, compromised)
+    if (!attempt.held) {
+      const refusal = attempt.refusal!
+      this.lockWait = refusal
+      this.runtimeHealth.set(lockHealth(refusal, machine.stateDir))
+      ctx.logger.error('dsh-superagent could not lock its state directory %s after %d attempt(s) and %d ms: %s; %s',
+        lockPath(machine.stateDir), refusal.attempts, refusal.waitedMs, refusal.error.message, holderText(refusal))
+      // Sources inject `orchestrator` and register their kinds as they mount; an inert registry keeps those entries
+      // mounted, and their polls stop at `configured() === false` instead of reaching for a database that is not open.
+      this.sources = new SourceRegistry(() => { throw lockWaitError(machine.stateDir) })
+      this.ready = this.serveLockWait()
+      return
+    }
+    const held = attempt.held
+    this.releaseLock = held.release
+    if (held.attempts > 1) ctx.logger.warn('dsh-superagent waited %d attempt(s) and %d ms for the state directory lock',
+      held.attempts, held.waitedMs)
     let opened: Store | undefined
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
@@ -139,13 +218,14 @@ export class Runtime extends Service implements SourceHost {
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
-        closing: () => this.closing(), environment,
+        closing: () => this.closing(), routerStopped: () => routerStopped(store),
+        environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
-        lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
+        lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.holds(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
@@ -175,11 +255,17 @@ export class Runtime extends Service implements SourceHost {
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
-        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
+        health: this.runtimeHealth, lifetime: this.lifetime, ready: () => setup.ready(), closing: () => this.closing() })
+      // The operator's control over the Router conversation: the stop/start switch, its audit trail, and deletions of the
+      // conversations this plugin owns. It reads the switch from the store on every delivery, so a stop takes effect on the
+      // next handoff and a start releases what the stop held.
+      this.control = new Control({ context: ctx, store, masterId, requestPass: () => { passes.request() },
+        sessionRoot: () => sessionRoot(ctx) })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
       get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
+        control: this.control,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         titleOf: async (sessionId: string) => {
@@ -192,38 +278,54 @@ export class Runtime extends Service implements SourceHost {
       this.ready = this.initialize()
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.
-      try { opened?.close() } finally { release() }
+      try { opened?.close() } finally { held.releaseSync() }
       throw error
     }
   }
   get health(): Readonly<Record<string, Health>> { return this.board.all }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
-  context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }
-  /** Resolved deployment; throws while waiting for setup (`!configured()`). */
-  get deployment(): Deployment { return this.setup.deployment }
-  configured(): boolean { return this.setup.configured() }
-  get setupProblem(): SetupProblem | undefined { return this.setup.problem }
+  context(kind: { kind: string; health: readonly string[] }): SourceContext {
+    return this.lockWait ? waitingContext(this.machine.stateDir) : sourceContextOf(this.sourceDeps, kind)
+  }
+  /** Resolved deployment; throws while waiting for setup (`!configured()`), or for another process's state directory lock. */
+  get deployment(): Deployment { return this.needs(this.setup).deployment }
+  configured(): boolean { return this.setup?.configured() ?? false }
+  get setupProblem(): SetupProblem | undefined { return this.setup?.problem }
   /** Why the Feishu bot is unavailable even though the Feishu Source configures a CLI. */
-  get feishuProblem(): SetupProblem | undefined { return this.setup.feishuProblem }
+  get feishuProblem(): SetupProblem | undefined { return this.setup?.feishuProblem }
   links(): LinkTarget {
-    const resolved = this.setup.configured() ? this.setup.deployment : undefined
+    const resolved = this.setup?.configured() ? this.setup.deployment : undefined
     const links = resolved ? { repository: resolved.repository, ...(resolved.feishu ? { feishu: resolved.feishu } : {}) } : {}
     return channel => this.sources.link(channel, links)
   }
   ticketEnvironment(ticket: Ticket): Variable[] {
-    const trigger = sourceTrigger(this, ticket)
-    const { setup: { deployment }, sources } = this
-    return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
+    const trigger = sourceTrigger(this, ticket), setup = this.needs(this.setup)
+    // Only an enabled Source reads the Deployment for its values, and a sourceless deployment resolved none: they stay absent.
+    const deployment = setup.configured() ? setup.deployment : undefined
+    return ticketEnvironment({ deployment, sources: this.needs(this.sources), settings: this.store.settings(), ticket,
+      ...trigger ? { trigger } : {} })
   }
-  checkSetup(): void { this.setup.check() }
-  receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
-  idle(): Promise<void> { return this.passes.idle() }
-  pump(): Promise<void> { return this.passes.pump() }
-  sendReplies(): Promise<void> { return this.outbox.sent() }
+  checkSetup(): void { this.setup?.check() }
+  receive(trigger: Trigger): ReceiveResult { return this.needs(this.passes).receive(trigger) }
+  idle(): Promise<void> { return this.needs(this.passes).idle() }
+  pump(): Promise<void> { return this.needs(this.passes).pump() }
+  sendReplies(): Promise<void> { return this.needs(this.outbox).sent() }
+  /** One of the parts the state directory's lock gates, or the wait's error while another process holds it. */
+  private needs<T>(part: T | undefined): T {
+    if (part === undefined) throw lockWaitError(this.machine.stateDir)
+    return part
+  }
   private closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  /**
+   * Hold launches and input deliveries: while a person paused processing, or before setup has finished.
+   * A sourceless deployment has finished (`Setup.ready`) although no Deployment resolved: it has no Source to poll, so
+   * nothing opens a Ticket on its own, but a person can still hand it one and its workers execute it. A Deployment that
+   * failed to resolve is not ready, so an installation whose required account settings are missing starts no worker.
+   */
+  private holds(): boolean { return !this.setup?.ready() || this.store.settings().paused }
   /**
    * Makes the Router's own conversation openable from the panel: it must belong to a Workspace the client knows (the
    * process working directory, not the plugin's state directory), and a Session with no message is hidden from the list,
@@ -231,10 +333,10 @@ export class Runtime extends Service implements SourceHost {
    */
   private async ensureRouterSession(): Promise<void> {
     try {
-      // The conversation must live in a Workspace the client already shows, or opening it reports the Session as unusable:
-      // `sessions.ensure` creates it in that Workspace instead of one made from the plugin's own directory.
+      // The conversation must live in a Workspace the client already shows, or opening it reports the Session as unusable.
+      // `ensure` names only that Workspace: DSH takes the directory from `workspace.path`.
       const workspace = await this.sessions.defaultWorkspace()
-      await this.sessions.ensure(this.masterId, process.cwd(), ROUTER_TITLE, 'orchestrator', workspace?.id)
+      await this.sessions.ensure(this.masterId, ROUTER_TITLE, 'orchestrator', workspace?.id)
       if (this.store.get(KV.runtime.greeted) !== this.masterId) {
         // Queued, not injected: a Session whose only message waits for a turn is still a draft the client cannot open, and
         // this one message is what turns the conversation into a real, listed Session with its own hello.
@@ -246,6 +348,16 @@ export class Runtime extends Service implements SourceHost {
       const renamed = await this.ctx.sessionController.rename({ sessionId: this.masterId as SessionId, title: ROUTER_TITLE })
       if ('error' in renamed) this.ctx.logger.warn('dsh-superagent could not title its router conversation: %s', String(renamed.error))
     } catch (error) { this.ctx.logger.warn('dsh-superagent could not prepare its router conversation: %s', String(error)) }
+  }
+  /**
+   * Serves the management API while another process holds the state directory. The plugin stays mounted and every route
+   * answers the wait with the `runtime` health entry, so the panel says why it is stopped instead of showing the 404s of
+   * routes that were never registered.
+   */
+  private async serveLockWait(): Promise<void> {
+    const refusal = this.lockWait
+    if (!refusal) return
+    this.disposers.push(registerLockWaitHttp(this.ctx, { refusal, machine: this.machine, health: () => this.health }))
   }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
@@ -271,6 +383,7 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+      control: this.control,
       // DSH's session calls queue behind a running turn; a bounded read keeps the panel from showing an endless spinner.
       listDshSessions: async () => bounded(this.ctx.sessionController.list({}, new AbortController().signal).then(listed => listed.items), 'the DSH session list'),
       /** The router conversation's last exchanges, so the panel can show it as the permanent chat it is. */
@@ -315,6 +428,18 @@ export class Runtime extends Service implements SourceHost {
         }
         return { sessionId: runtime.masterId, items: items.slice(-limit) }
       },
+      /**
+       * The virtual Router workspace's rows. Durable Session headers decide membership: the `agentPreset` projection
+       * reads `standard` for the shipped 常驻 conversation although its header says `dsh-superagent-router`. The host
+       * list supplies only titles and recency, so a slow list degrades the rows instead of failing the whole group.
+       */
+      routerSessions: async () => {
+        const stored = await bounded(runtime.ctx.sessionPersistence.list(), 'the stored Session headers')
+        const listed = await bounded(runtime.ctx.sessionController.list({}, new AbortController().signal)
+          .then(found => found.items), 'the DSH session list').catch(() => [])
+        return { masterId: runtime.masterId,
+          items: selectRouterSessions(stored.map(snapshot => snapshot.header), listed, runtime.masterId) }
+      },
       /** Delivery shapes of the router transcript, so the panel and its tests can rely on the fields DSH really emits. */
       routerEventTypes: async () => {
         const events = (await runtime.ctx.sessionController.inspect(runtime.masterId as SessionId)).events as readonly { type?: string; data?: unknown }[]
@@ -328,10 +453,11 @@ export class Runtime extends Service implements SourceHost {
         const found = events.find(event => event.type === type)
         return { found: found ? JSON.stringify(found).slice(0, 1200) : null }
       },
-      /** Delivers one message into the router conversation; its reply arrives as the conversation runs. */
+      /** Delivers one message into the router conversation; its reply arrives as the conversation runs. A stopped Router
+       * holds it in the durable queue instead of waking, and a start hands it over in arrival order. */
       routerSend: async text => {
-        await runtime.sessions.prompt(runtime.masterId, key('router-chat', String(Date.now()), text), text, 'queue')
-        return { sent: true as const }
+        runtime.sessions.routerMessage(key('router-chat', String(Date.now()), text), text)
+        return { sent: true as const, ...(runtime.control.stopped ? { queued: true as const } : {}) }
       },
       // `get` returns undefined when no Plugin Market is mounted; a property access would throw without an injection.
       get pluginMarket() { return runtime.ctx.get('pluginMarket') as HttpHost['pluginMarket'] | undefined },
@@ -344,7 +470,10 @@ export class Runtime extends Service implements SourceHost {
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
-    this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
+    this.closingFlag = true
+    // Waiting for another process's state directory: nothing was opened, so only the wait's routes unmount.
+    if (this.lockWait) { for (const dispose of this.disposers.reverse()) dispose(); return }
+    const passes = this.needs(this.passes).stop(); this.stopped.abort()
     try {
       this.assessor.stop()
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]

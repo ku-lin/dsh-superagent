@@ -1,4 +1,5 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
+import { resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
@@ -1083,20 +1084,30 @@ describe('the Executor\'s parts', () => {
 })
 
 describe('a worker is an ordinary conversation in the Workspace', () => {
-  it('creates it in the Workspace the client shows, keeps its ticket directory, and names it after the ticket', async () => {
+  it('creates it in the Workspace for its ticket directory, names only that Workspace, and titles it after the ticket', async () => {
     h.workspaceRegistry.initializeDefault.mockResolvedValue({ id: 'ws-client', path: '/work' })
+    h.workspaceRegistry.create.mockClear()
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const ticket = h.runtime.store.tickets.get(one.ticket.id)!
+    const directory = ticket.execution!.directory
     const created = h.controller.create.mock.calls
       .map(([options]) => options as { sessionId: string; workspaceId: string; cwd?: string; agentPreset?: string })
       .find(options => options.sessionId === one.sessionId)!
-    // Joining the client's Workspace is what makes the conversation findable; `cwd` still keeps the ticket's directory.
-    expect(created.workspaceId).toBe('ws-client')
+    // The Workspace for the ticket's own directory is what makes the conversation findable there. A host that lists no
+    // Workspace for it has one registered, exactly as opening that directory would.
+    const [registered] = h.workspaceRegistry.create.mock.calls[0] ?? []
+    expect(registered).toBeDefined()
+    expect(created.workspaceId).toBe(registered)
+    const samePlace = (left: string, right: string): boolean =>
+      resolve(left).toLowerCase() === resolve(right).toLowerCase()
+    expect(samePlace(registered!, directory)).toBe(true)
+    // Only the Workspace: DSH rejects a create that names both it and a `cwd`, and derives the directory from the Workspace.
+    expect(created).not.toHaveProperty('cwd')
     expect(created.agentPreset).toBe('dsh-superagent-worker')
-    expect(created.cwd).toBe(h.runtime.store.tickets.get(one.ticket.id)!.execution!.directory)
     const renames = (h.controller.rename as unknown as { mock: { calls: [{ sessionId: string; title: string }][] } }).mock.calls
     const renamed = renames.map(([options]) => options).find(options => options.sessionId === one.sessionId)
     expect(renamed?.title).toMatch(/^worker-\S+ · .+$/u)
-    expect(renamed?.title).toContain(h.runtime.store.tickets.get(one.ticket.id)!.title)
+    expect(renamed?.title).toContain(ticket.title)
   })
 
   it('hands a message to a worker and returns without waiting for its turn', async () => {

@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
+import { ControlError } from '../src/app/control.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
@@ -115,6 +116,46 @@ it('discovers only configured plugin indexes without installing anything', async
   expect(queries).toEqual([['https://market.example/index.json',
     { text: 'hello', sort: { kind: 'relevance' }, offset: 0, limit: 30 }]])
   expect(await serve({})('GET', 'plugin-indexes')).toEqual({ status: 200, body: { available: false, items: [] } })
+})
+
+it('exposes the Router switch and deletes a conversation only with confirm and only for an owned one', async () => {
+  const calls: [string, unknown][] = []
+  const switchValue = { paused: false, reason: '', at: '', by: 'panel' as const }
+  const control = {
+    router: switchValue,
+    stopRouter: (reason: string, by: string) => { calls.push(['stop', { reason, by }]); return { ...switchValue, paused: true, reason, by } },
+    startRouter: (by: string) => { calls.push(['start', by]); return { ...switchValue, by } },
+    deleteSession: async (id: string, confirm: boolean, by: string) => {
+      calls.push(['delete', { id, confirm, by }])
+      if (!confirm) throw new ControlError('confirmRequired', 'Deleting a conversation requires confirm: true')
+      if (id === 'master') throw new ControlError('routerSession', 'The Router conversation cannot delete itself', 409)
+      if (id === 'session-plain') throw new ControlError('notDeletable', 'Only a worker conversation can be deleted', 409)
+      return { sessionId: id, kind: 'worker' as const, archived: true as const, detached: [], projections: 'absent' as const,
+        log: { state: 'retained' as const, reason: 'no root' } }
+    },
+  }
+  const call = serve({ control, store: { settings: () => SettingsSchema.parse({}), tickets: { open: () => [] } },
+    configured: () => false,
+    machine: { stateDir: '/state', promptMaxChars: { get: () => 1000 }, admissionContextMaxPages: { get: () => 1 },
+      admissionContextTimeoutMs: { get: () => 1000 } },
+    executor: { activeCount: () => 0 } })
+  // The switch is part of `GET state`, separate from the Executor's own `paused`.
+  expect(await call('GET', 'state')).toMatchObject({ status: 200, body: { paused: false, router: { paused: false } } })
+  expect(await call('POST', 'router/stop', { reason: ' deploy ' })).toMatchObject({ status: 200,
+    body: { paused: true, reason: ' deploy ', by: 'panel' } })
+  expect(await call('POST', 'router/start')).toMatchObject({ status: 200, body: { paused: false } })
+  expect(calls).toEqual([['stop', { reason: ' deploy ', by: 'panel' }], ['start', 'panel']])
+  // A deletion without `confirm=true` is a 400, and the Router conversation is a 409; a person's own is a 409 too.
+  expect(await call('DELETE', 'sessions/worker-t1')).toEqual({ status: 400,
+    body: { error: 'Deleting a conversation requires confirm: true', code: 'confirmRequired' } })
+  expect(await call('DELETE', 'sessions/worker-t1?confirm=false')).toMatchObject({ status: 400 })
+  expect(await call('DELETE', 'sessions/master?confirm=true')).toEqual({ status: 409,
+    body: { error: 'The Router conversation cannot delete itself', code: 'routerSession' } })
+  expect(await call('DELETE', 'sessions/session-plain?confirm=true')).toMatchObject({ status: 409 })
+  expect(await call('DELETE', 'sessions/worker-t1?confirm=true')).toMatchObject({ status: 200,
+    body: { sessionId: 'worker-t1', kind: 'worker', archived: true, log: { state: 'retained' } } })
+  // The switch is a management write like the others: no same-origin request header means no answer.
+  expect(await call('POST', 'router/stop', { reason: '' }, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
 })
 
 it('answers only a same-origin request from the panel on the loopback address', async () => {
