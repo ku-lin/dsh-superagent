@@ -401,6 +401,13 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-worker-status-borrowed { border-color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-border-l3)); }
 .dt-worker-status-unavailable { color: var(--dsw-alias-label-caption); }
 
+/* A worker's title in the Router's conversation: looks like a link, because it opens that conversation. */
+.dt-session-link { display: inline; padding: 0; border: 0; background: none; color: var(--dsw-alias-brand-primary, #6366f1);
+  cursor: pointer; font: inherit; text-align: start; text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 2px; }
+.dt-session-link:hover { text-decoration-color: currentColor; }
+.dt-session-link:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #6366f1); outline-offset: 2px; border-radius: 3px; }
+
 /* The console card: the same surface the panel's other cards use, so it reads correctly on light and dark themes. */
 .dt-router-chat { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 14px 16px; border-radius: 16px;
   background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); }

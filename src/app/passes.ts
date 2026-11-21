@@ -8,7 +8,8 @@ export interface PassesHost {
   readonly effects: Pick<Effects, 'kick' | 'idle'>
   readonly health: HealthEntry
   readonly lifetime: AbortSignal
-  configured(): boolean
+  /** Whether setup finished, so queued work may run; a sourceless deployment counts as finished (see `Setup.ready`). */
+  ready(): boolean
   closing(): boolean
 }
 
@@ -54,8 +55,9 @@ export class Passes {
   }
   /** Run one pass, coalescing concurrent callers into a single follow-up pass. */
   async pump(): Promise<void> {
-    // Do not assess, dispatch, or send while waiting for setup; queued work waits for the restart that completes setup.
-    if (!this.host.configured() || this.host.closing()) return
+    // Do not assess, dispatch, or send before setup has finished; queued work waits for the restart that completes it. A
+    // sourceless deployment has finished, and each effect kind still holds itself (concurrency limit 0) while it cannot run.
+    if (!this.host.ready() || this.host.closing()) return
     if (!this.pumping) return this.pumping = this.pumpOnce().finally(() => { this.pumping = undefined })
     const next = () => { this.pumpAgain = undefined; return this.pump() }
     return this.pumpAgain ??= this.pumping.then(next, next)

@@ -102,9 +102,16 @@ function seed(store: Store, accounts: Accounts = {}): void {
   store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
 }
 let restarts: ReturnType<typeof vi.fn<() => void>>
-async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
+/**
+ * Restarts on the same state directory, as a process restart would. `options.sources: false` leaves every Source out of the
+ * settings, which is a Router-only deployment: nothing polls, and the only work is what a person hands over.
+ */
+async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}, options: { sources?: boolean } = {}): Promise<Runtime> {
   await runtime.stop()
-  const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store, accounts); store.close()
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  if (options.sources === false) store.saveSettings(SettingsSchema.parse({ ...store.settings(), sources: {} }))
+  else seed(store, accounts)
+  store.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machine }), restarts)
@@ -842,6 +849,94 @@ it('waits for setup without the agent\'s GitHub CLI: the panel works, and nothin
   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(2))
 })
 
+it('runs a Ticket that already waits for a worker when no Source is configured at all', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  controller.create.mockClear(); deliveries.mockClear()
+  // The conversation goes away with the process that ran it, and the ticket directory with its worktree is gone again, so
+  // the restart has to prepare it and start the worker, as a fresh process would.
+  agents.delete(sessionId)
+  rmSync(ticket.execution!.directory, { recursive: true, force: true })
+  const next = await restart({}, {}, { sources: false })
+  await next.ready
+  // Nothing can open a Ticket here, and that is no longer the same thing as a deployment that is not set up.
+  expect(next.setup.sourceless).toBe(true)
+  expect(next.configured()).toBe(false)
+  expect(next.health.runtime).toMatchObject({ state: 'ready' })
+  await vi.waitFor(() => expect(next.store.tickets.get(ticket.id)!.assignments.at(-1)!.state).toBe('running'))
+  expect(controller.create.mock.calls.map(([call]) => call.sessionId)).toContain(sessionId)
+  expect(relays(sessionId).some(item => item.ticket_id === ticket.id)).toBe(true)
+  expect(readdirSync(ticket.execution!.directory)).toEqual([])
+  // Its execution environment keeps the Executor's own variables, which read no account; no Source registers any here.
+  const environment = Object.fromEntries(next.ticketEnvironment(next.store.tickets.get(ticket.id)!).map(variable => [variable.key, variable.value]))
+  expect(environment).toMatchObject({ DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_TICKET: ticket.id })
+  expect(environment).not.toHaveProperty('DSH_SUPERAGENT_GITHUB_REPOSITORY')
+})
+
+it('dispatches a ready Ticket a person retries in a deployment with no Source at all', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  controller.create.mockClear(); deliveries.mockClear()
+  // A worker whose turn failed: the Ticket has a report and still asks for a retry, and the retry is what a person presses.
+  await runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'the shell died' })
+  await runtime.idle()
+  // The failed report leaves the Ticket asking for a person, which is the state a retry acts on.
+  expect(waitsForPerson(runtime.store.tickets.get(ticket.id)!)).toBe(true)
+  const next = await restart({}, {}, { sources: false })
+  await next.ready
+  // No Deployment resolved, and that is deliberate: the Executor's launch and input handlers are held on `ready()`, not on
+  // `configured()`, so a Ticket handed to a sourceless Router is dispatched instead of waiting for a Source that never comes.
+  expect(next.setup.sourceless).toBe(true)
+  expect(next.configured()).toBe(false)
+  expect(next.health.runtime).toMatchObject({ state: 'ready' })
+  next.engine.retryTicket(ticket.id)
+  // The launch goes through the effect queue, which the two-second tick picks up; the conversation still exists, so the
+  // retry reaches it as the note a retry sends instead of creating it again.
+  await next.pump()
+  await vi.waitFor(() => expect(next.store.tickets.get(ticket.id)!.assignments.at(-1)!.state).toBe('running'), { timeout: 8000 })
+  expect(relays(sessionId).at(-1)).toMatchObject({ ticket_id: ticket.id, note: expect.stringContaining('A person retried this ticket') })
+})
+
+it('starts no worker for a waiting Ticket while setup itself is incomplete', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  controller.create.mockClear(); deliveries.mockClear()
+  // A Source is configured and its CLI is missing, so setup never finished: unlike a deployment with no Source, this one
+  // executes nothing, and no pass dispatches what the interrupted Assignment would need.
+  const next = await restart({}, { github: { cli: '' } })
+  await next.ready
+  expect(next.setup.sourceless).toBe(false)
+  expect(next.configured()).toBe(false)
+  expect(next.health.runtime).toMatchObject({ state: 'paused', code: 'setupPending' })
+  await next.pump()
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect(controller.create.mock.calls.map(([call]) => call.sessionId)).not.toContain(sessionId)
+  expect(relays(sessionId)).toEqual([])
+  // The ticket waits as the stopped process left it: neither restarted nor failed.
+  expect(next.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['running'])
+})
+
+it('comes up ready on a fresh state directory with no Source at all, creating its Router conversation', async () => {
+  await runtime.stop()
+  const fresh = mkdtempSync(join(tmpdir(), 'orchestrator-sourceless-'))
+  const ctx = new Context()
+  for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+  controller.create.mockClear(); deliveries.mockClear()
+  runtime = new Runtime(ctx, testMachine({ stateDir: fresh }), restarts)
+  try {
+    await runtime.ready
+    // A first start with nothing configured to poll still comes up: the Router conversation is the way in, and no worker
+    // Session is created before a person hands over a Ticket.
+    expect(runtime.setup.sourceless).toBe(true)
+    expect(runtime.configured()).toBe(false)
+    expect(runtime.health.runtime).toMatchObject({ state: 'ready' })
+    const created = controller.create.mock.calls.map(([call]) => call.sessionId)
+    expect(created).toEqual([runtime.masterId])
+    expect(deliveries.mock.calls.map(([call]) => call.sessionId)).toEqual([runtime.masterId])
+    expect(runtime.store.tickets.list()).toEqual([])
+  } finally {
+    await runtime.stop()
+    rmSync(fresh, { recursive: true, force: true })
+  }
+})
+
 it('reports each setup problem where the operator fixes it, and checks the agent CLI the way worker shells run it', async () => {
   const needs = async (place: string, code: string, values: Record<string, string>, accounts: Accounts = {}) => {
     const next = await restart({}, accounts)
@@ -1367,14 +1462,22 @@ it('keeps replies and acknowledgements to an IM conversation within the IM limit
   await expect(runTool(sessionId, 'orchestrator_ack', { trigger_id: follow.id, text: long })).rejects.toThrow(`at most ${IM_WORDS} words`)
 })
 
-it('refuses a second process on the same state directory before it opens the database, so it migrates nothing', () => {
+it('waits for and then reports a second process on the same state directory, opening no database and migrating nothing', async () => {
   // A database the running build would read as schema 10 stays as it is.
   const db = new DatabaseSync(join(directory, 'orchestrator.sqlite'))
   db.prepare("UPDATE kv SET value='10' WHERE key='schema'").run()
   db.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-  expect(() => new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())).toThrow(/already being held/)
+  const answered = http
+  // The first Runtime holds the lock: a start that cannot wait it out reports the wait and opens nothing, rather than throwing.
+  const second = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn(), { attempts: 1, waitMs: 0 })
+  await second.ready
+  expect(second.lockWait?.error.message).toMatch(/already being held/)
+  expect(second.health.runtime).toMatchObject({ state: 'starting', code: 'lockWait' })
+  expect(second.configured()).toBe(false)
+  await second.stop()
+  http = answered
   expect(runtime.store.get(KV.store.schema)).toBe(10)
   runtime.store.set(KV.store.schema, SCHEMA_VERSION)
 })

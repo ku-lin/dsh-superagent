@@ -1,11 +1,16 @@
 /**
- * The virtual Router workspace: one group inside DSH's own workspace list that aggregates router-level Sessions.
+ * The virtual Router workspace: one group inside DSH's own workspace list that aggregates the router's own conversations.
  *
  * Virtual by construction — no Workspace record, no directory, no ownership write. The group is a DOM mount inside the
  * shipped browser's `[data-slot="sidebar.workspaces"]` region (the same seam the installed dsh-plugin-sidebar-views
  * uses), it lists whatever `GET router-sessions` selects from durable Session headers, and it hides those Sessions'
- * native rows so one conversation never appears twice. Nothing is persisted except the fold state, so disabling the
- * plugin restores the original list exactly.
+ * native rows so one conversation never appears twice. Nothing is persisted except the fold state and the operator's
+ * hiding switch, so disabling the plugin restores the original list exactly.
+ *
+ * Worker Sessions are not part of the group and are never hidden: a worker is an ordinary conversation inside the
+ * Workspace its ticket works in, and the person asked to find it there. Only the rows this group actually renders are
+ * ever suppressed, and only while the group is on screen and unfolded — hiding the native row of a conversation whose
+ * replacement is scrolled out of sight (this group sits at the bottom of a long workspace list) would leave it nowhere.
  *
  * Every step degrades silently: a missing anchor, an unreachable host, or a renamed row attribute leaves the native
  * workspace list untouched and this module inert.
@@ -18,9 +23,21 @@ import { when, type T } from './text.ts'
 const ANCHOR = '[data-slot="sidebar.workspaces"]'
 /** Attribute naming one native row, which is how a migrated Session's own row is suppressed. */
 const ROW_KEY = 'data-row-key'
+/** Id prefix a worker Session is created with; its native row is never hidden, whatever a host answers. */
+const WORKER_PREFIX = 'worker-'
 /** Fold state of the group, the only value this module persists. */
 const COLLAPSED_KEY = 'dsh-superagent/router-workspace/collapsed'
+/**
+ * Whether the group may hide the migrated Session's own row. `'0'` is the operator's restore switch.
+ *
+ * Versioned: the first spelling of this key was written by the failure escape hatch as well as by the switch, so a
+ * single failed read left `'0'` behind for good and the duplicate row came back on every later load. The failure path
+ * no longer persists anything (a failed read hides nothing by itself), and the old key is deliberately not read.
+ */
+const SUPPRESS_KEY = 'dsh-superagent/router-workspace/suppress-native.v2'
 const POLL_MS = 4000
+/** Overflow values a sidebar container scrolls with; used to find the boxes that can clip the group out of sight. */
+const SCROLLS = /(auto|scroll|overlay)/
 
 /** One row as the group renders it: the host row plus the label and recency the list shows. */
 interface Item extends RouterSessionRow {
@@ -62,6 +79,8 @@ let timer: ReturnType<typeof setInterval> | undefined
 let pendingReveal = false
 let disposed = false
 let polling = false
+/** Set by the degraded note's restore action: this page shows every native row until it is reloaded. */
+let paused = false
 
 /**
  * Mount bookkeeping shared through the window, because a reloaded client bundle evaluates this module again and its
@@ -115,7 +134,12 @@ const CSS = `
 .dsr-running .dsr-dot{background:var(--dsw-alias-state-success-primary,#22c55e);animation:dsr-pulse 1.6s ease-in-out infinite}
 .dsr-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsr-ago{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px}
-.dsr-note{padding:2px 8px 6px;color:var(--dsw-alias-label-tertiary);font-size:11px}
+.dsr-note{padding:2px 8px 6px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.dsr-restore{margin-inline-start:6px;height:22px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.24));
+  border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit;font-size:11px}
+.dsr-restore:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12));color:var(--dsw-alias-label-primary)}
+.dsr-page-toggle{display:flex;align-items:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer}
+.dsr-page-toggle input{cursor:pointer}
 .dsr-flash{animation:dsr-flash 1.2s ease-out}
 .dt-router-entry{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 8px;border:none;border-radius:var(--dsw-radius-md,8px);
   background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit;font-size:12px}
@@ -254,11 +278,17 @@ function signature(items: readonly Item[]): string {
 /** One session row: status dot, title, and recency; a derived Session is indented under its router. */
 function rowElement(item: Item, collapsed: boolean): HTMLElement {
   const row = document.createElement('div')
+  const t = deps?.t()
+  const status = t === undefined ? '' : item.running ? t('workerStatusRunning') : t('workerStatusIdle')
   row.className = `dsr-row${item.running ? ' dsr-running' : ''}`
   row.dataset.sessionId = item.sessionId
+  row.dataset.status = item.running ? 'running' : 'idle'
   row.setAttribute('role', 'button')
+  // The dot alone says nothing to a screen reader, and the tooltip names the state the dot stands for.
+  const line = status === '' ? item.label : `${item.label} · ${status}`
+  row.setAttribute('aria-label', line)
   row.tabIndex = collapsed ? -1 : 0
-  row.title = item.cwd !== undefined ? `${item.label}\n${item.cwd}` : item.label
+  row.title = item.cwd !== undefined ? `${line}\n${item.cwd}` : line
   const dot = document.createElement('span')
   dot.className = 'dsr-dot'
   const title = document.createElement('span')
@@ -285,20 +315,112 @@ function render(): void {
   dom.count.textContent = String(current.items.length)
   dom.count.hidden = current.items.length === 0
   dom.body.replaceChildren(...current.items.map(item => rowElement(item, current.collapsed)))
-  const note = current.error ?? (current.items.length === 0 ? t('routerWorkspaceEmpty') : '')
-  dom.note.textContent = note
-  dom.note.hidden = note === ''
+  // A failed read says so and offers a way back; rows that could not be read hide nothing (see applySuppression).
+  if (current.error !== undefined) {
+    const message = document.createElement('span')
+    message.textContent = `${t('routerWorkspaceDegraded')} ${current.error}`
+    const restore = document.createElement('button')
+    restore.type = 'button'
+    restore.className = 'dsr-restore'
+    restore.textContent = t('routerWorkspaceRestore')
+    // Never persists: a failed read must not be able to pin hiding off for every later page load.
+    restore.addEventListener('click', () => {
+      paused = true
+      applySuppression(dom)
+      render()
+    })
+    dom.note.replaceChildren(message, restore)
+    dom.note.hidden = false
+  } else if (current.items.length === 0) {
+    dom.note.textContent = t('routerWorkspaceEmpty')
+    dom.note.hidden = false
+  } else if (!readSuppressNative()) {
+    // Hiding is off by the operator's own choice: say so, and make turning it back on one click rather than a settings
+    // hunt, because this is exactly the state that reads as "the duplicate came back".
+    const message = document.createElement('span')
+    message.textContent = t('routerWorkspaceShown')
+    const again = document.createElement('button')
+    again.type = 'button'
+    again.className = 'dsr-restore'
+    again.textContent = t('routerWorkspaceHideAgain')
+    again.addEventListener('click', () => { setSuppressNative(true) })
+    dom.note.replaceChildren(message, again)
+    dom.note.hidden = false
+  } else {
+    dom.note.textContent = ''
+    dom.note.hidden = true
+  }
   // A migrated Session keeps its native row out of the list: the same conversation must not appear twice.
   applySuppression(dom)
 }
 
-/** Suppress exactly the listed Sessions' native rows, and nothing at all while the group is not mounted. */
+/**
+ * Whether the group is actually on screen: inside the viewport, and not clipped away by a scrolling ancestor. The group is
+ * pinned to the end of the workspace list, so on a populated sidebar it starts out of sight; while it is, the conversations
+ * it lists must keep their native rows, or the person is shown neither.
+ */
+function onScreen(element: HTMLElement): boolean {
+  const box = element.getBoundingClientRect()
+  // No layout box means nothing is rendered there: a collapsed or hidden sidebar must not cost anyone a conversation.
+  if (box.width === 0 || box.height === 0) return false
+  const height = window.innerHeight || document.documentElement.clientHeight
+  const width = window.innerWidth || document.documentElement.clientWidth
+  if (box.bottom <= 0 || box.top >= height || box.right <= 0 || box.left >= width) return false
+  // The list scrolls its own box: being inside the viewport is not enough once that box has scrolled past the group.
+  for (let node = element.parentElement; node !== null && node !== document.body; node = node.parentElement) {
+    const style = window.getComputedStyle(node)
+    if (!SCROLLS.test(`${style.overflowY} ${style.overflowX}`)) continue
+    const clip = node.getBoundingClientRect()
+    if (box.bottom <= clip.top || box.top >= clip.bottom || box.right <= clip.left || box.left >= clip.right) return false
+  }
+  return true
+}
+
+/** Recompute the rule when the page moves; scroll events arrive in bursts, so at most one pass per frame is scheduled. */
+let frame = 0
+function scheduleRecheck(): void {
+  if (frame !== 0) return
+  const run = (): void => { frame = 0; if (handle !== undefined) applySuppression(handle) }
+  // jsdom (the unit-test host) has no animation frames unless the window pretends to be visual.
+  frame = typeof window.requestAnimationFrame === 'function'
+    ? window.requestAnimationFrame(run) : window.setTimeout(run, 16) as unknown as number
+}
+
+/**
+ * Suppress exactly the listed Sessions' native rows — and nothing at all whenever hiding could cost the person the
+ * conversation: no mount, a failed host read, an empty list, the operator's own off switch, a folded group, or a group
+ * scrolled out of sight. Only the rows this group renders are named, so a worker, which the group never lists, keeps the
+ * row in its own Workspace. Called after every render, after every attach, and whenever the shipped list re-renders or
+ * the sidebar scrolls, so a rendered group always comes with a freshly computed rule.
+ */
 function applySuppression(dom: Handle): void {
   const items = view?.items ?? []
-  // Without the mount the group cannot show the conversation, so its native row must stay visible: never hide and drop.
-  dom.hide.textContent = dom.host.isConnected
-    ? items.map(item => `[data-slot="sidebar.workspaces"] [${ROW_KEY}="session:${item.sessionId}"]{display:none!important}`).join('\n')
+  // A host older than this bundle can still answer with a worker row, because the two are reloaded separately. A worker is
+  // never hidden: it belongs in the Workspace it works in, and a duplicate row is a better failure than a missing one.
+  const listed = items.filter(item => !item.sessionId.startsWith(WORKER_PREFIX))
+  const shown = dom.host.isConnected && onScreen(dom.host)
+  const safe = shown && view?.collapsed !== true && view?.error === undefined && listed.length > 0
+    && readSuppressNative() && !paused
+  const css = safe
+    ? listed.map(item => `[data-slot="sidebar.workspaces"] [${ROW_KEY}="session:${item.sessionId}"]{display:none!important}`).join('\n')
     : ''
+  if (dom.hide.textContent !== css) dom.hide.textContent = css
+}
+
+/** Whether this client may hide the migrated Session's own row; the panel's switch and the failure path both use it. */
+export function readSuppressNative(): boolean {
+  try { return window.localStorage.getItem(SUPPRESS_KEY) !== '0' } catch { return true }
+}
+
+/** Turn row hiding on or off and apply it at once; off always shows every native row, including a healthy read. */
+export function setSuppressNative(on: boolean): void {
+  try { window.localStorage.setItem(SUPPRESS_KEY, on ? '1' : '0') } catch { /* Reading memory is a convenience. */ }
+  // An explicit choice from the switch outranks the degraded note's page-only pause.
+  paused = on ? false : paused
+  if (handle !== undefined) {
+    applySuppression(handle)
+    render()
+  }
 }
 
 /** Watch the list so a render that appends its own rows cannot leave the group in the middle of it. */
@@ -308,6 +430,9 @@ let observed: HTMLElement | undefined
 /** Keep the group the last child of the list, and re-assert that when the list's children change. */
 function pinLast(root: HTMLElement, dom: Handle): void {
   if (dom.host.parentElement !== root || root.lastElementChild !== dom.host) root.appendChild(dom.host)
+  // A shipped re-render may rebuild the list around the group; recompute the rule here so a rendered group always
+  // carries one, whichever path attached it.
+  applySuppression(dom)
   if (observer !== undefined && observed === root) return
   observer?.disconnect()
   observed = root
@@ -344,6 +469,8 @@ function reveal(): void {
     render()
   }
   dom.host.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  // Now that the group is being brought into sight, the rule may hide the native rows it could not hide before.
+  scheduleRecheck()
   dom.host.classList.remove('dsr-flash')
   // Read the offset so the animation restarts when the entry is used twice in a row.
   void dom.host.offsetWidth
@@ -390,12 +517,19 @@ export function mountRouterWorkspace(options: RouterWorkspaceDeps): () => void {
   const mine = supersede()
   deps = options
   disposed = false
+  // A fresh mount is a fresh page: the degraded note's temporary pause does not outlive the group it was meant for.
+  paused = false
   const onVisible = (): void => { if (!document.hidden) void poll() }
+  // The group is pinned to the end of the workspace list, so it scrolls out of sight on its own: recompute the rule when
+  // the page moves (capture, because a sidebar list scrolls without bubbling) instead of only when the list re-renders.
+  const onMove = (): void => { scheduleRecheck() }
   const stop = (): void => {
     disposed = true
     if (timer !== undefined) clearInterval(timer)
     timer = undefined
     document.removeEventListener('visibilitychange', onVisible)
+    window.removeEventListener('scroll', onMove, true)
+    window.removeEventListener('resize', onMove)
     const dom = handle
     handle = undefined
     view = undefined
@@ -412,6 +546,8 @@ export function mountRouterWorkspace(options: RouterWorkspaceDeps): () => void {
     observed = undefined
   }
   document.addEventListener('visibilitychange', onVisible)
+  window.addEventListener('scroll', onMove, true)
+  window.addEventListener('resize', onMove)
   timer = setInterval(() => {
     if (shared().owner !== mine) { stop(); return }
     attach(); void poll()

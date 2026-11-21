@@ -9,6 +9,7 @@ import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssess
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import { sessionLink } from '../session-link.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import type { Store } from '../store.ts'
@@ -366,7 +367,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const tickets = host.store.tickets.open()
         const claimed = new Map(tickets.flatMap(ticket => ticket.execution?.borrowedSession
           ? [[ticket.execution.borrowedSession.sessionId, ticket] as const] : []))
-        const items: { title: string; running: boolean; available: boolean; ticket?: string; session: string }[] = []
+        const items: { title: string; running: boolean; available: boolean; ticket?: string; session: string; link: string }[] = []
         for (const item of listed.items) {
           if (item.sessionId === agent.id) continue
           // Answer with the conversation's title, never its id: a person reading this chat should not have to parse ids.
@@ -376,7 +377,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           if (!title) title = await host.titleOf(item.sessionId).catch(() => '')
           const ticket = claimed.get(item.sessionId)
           items.push({ title, running: item.running, available: item.agentAvailable,
-            ...(ticket ? { ticket: ticket.title } : {}), session: item.sessionId })
+            ...(ticket ? { ticket: ticket.title } : {}), session: item.sessionId, link: sessionLink(item.sessionId, title) })
         }
         return { items }
       },
@@ -405,11 +406,11 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         // wants the answer inline.
         if (args.wait_seconds === 0) {
           void answerLater(host, agent, worker, from, title, signal)
-          return { session: sessionId, title, delivered: true, finished: false }
+          return { session: sessionId, title, link: sessionLink(sessionId, title), delivered: true, finished: false }
         }
         const finished = await untilIdle(worker, args.wait_seconds * 1000, signal)
         const reply = answerAfter(worker, from)
-        return { session: sessionId, title, delivered: true, finished, ...(reply ? { reply } : {}) }
+        return { session: sessionId, title, link: sessionLink(sessionId, title), delivered: true, finished, ...(reply ? { reply } : {}) }
       },
     }),
   ]

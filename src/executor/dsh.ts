@@ -4,7 +4,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, normalize, resolve } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
@@ -28,11 +28,35 @@ export const ticketOfSession = (sessionId: string): string | undefined => sessio
 /** A loan never changes the conversation's owner or session settings. */
 export const executionSessionId = (ticket: Ticket): string => ticket.execution?.borrowedSession?.sessionId ?? workerSessionId(ticket.id)
 /**
+ * Bytes the ticket's own words may take in a worker conversation's title. DSH stores a title in at most 80 UTF-8 bytes
+ * (`session-title`'s `maxTitleBytes`) and cuts on a byte boundary; leaving most of that budget to the ticket title keeps
+ * the `worker-<id8> · ` prefix intact and stops a CJK title from being chopped in the middle by the host.
+ */
+const WORKER_TITLE_BYTES = 56
+/**
+ * The longest prefix of `input` within `maxBytes` UTF-8 bytes, never splitting a code point.
+ * @param input - text to shorten.
+ * @param maxBytes - the byte budget, at least 1.
+ * @returns the prefix, possibly empty.
+ */
+export function clipUtf8(input: string, maxBytes: number): string {
+  if (Buffer.byteLength(input, 'utf8') <= maxBytes) return input
+  let used = 0, output = ''
+  for (const character of input) {
+    const bytes = Buffer.byteLength(character, 'utf8')
+    if (used + bytes > maxBytes) break
+    output += character
+    used += bytes
+  }
+  return output.trimEnd()
+}
+/**
  * The title a worker conversation carries in the Workspace: `worker-<id8> · <ticket title>`, so a person scrolling the list
- * can tell which conversation works on what, and open it like any other conversation.
+ * can tell which conversation works on what, and open it like any other conversation. The ticket's own words are clipped to
+ * the byte budget the host keeps, so the name DSH stores is exactly this one instead of a host-truncated cut of it.
  */
 export const workerTitle = (ticket: Pick<Ticket, 'id' | 'title'>): string =>
-  `worker-${ticket.id.replace(/^t[-_]/i, '').slice(0, 8)} · ${ticket.title}`
+  `worker-${ticket.id.replace(/^t[-_]/i, '').slice(0, 8)} · ${clipUtf8(ticket.title.trim(), WORKER_TITLE_BYTES)}`
 /** Maximum runtime for a workspace prepare command. */
 const PREPARE_TIMEOUT_MS = 10 * 60_000
 /** Maximum transient retry attempts for a launch or worker turn, and the initial backoff before resuming a turn. */
@@ -79,7 +103,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'borrow' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'ensureWorker' | 'workspaceFor' | 'borrow' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -205,6 +229,53 @@ export class WorkerSlots {
   }
   /** Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. */
   free(ticketId: string): void { this.starting.delete(ticketId) }
+  /** Ticket IDs holding a slot now: running workers plus startup reservations, which is what a Workspace lease checks. */
+  occupants(): ReadonlySet<string> { return new Set([...this.running(), ...this.starting.keys()]) }
+}
+
+/**
+ * The queue behind the per-Workspace lease: launches parked because another worker holds their Workspace, oldest
+ * first, taken back only while that Workspace is free. Different Workspaces never wait on each other.
+ */
+export class WorkspaceParking {
+  private readonly waiting = new Map<string, { ticketId: string; assignmentId: string }[]>()
+  /** Parks a launch behind its Workspace's current worker; a newer assignment of the same ticket replaces the old one. */
+  park(key: string, ticketId: string, assignmentId: string): void {
+    const queue = (this.waiting.get(key) ?? []).filter(item => item.ticketId !== ticketId)
+    queue.push({ ticketId, assignmentId })
+    this.waiting.set(key, queue)
+  }
+  /** Keys with at least one parked launch. */
+  keys(): readonly string[] { return [...this.waiting.keys()] }
+  /** Parked launches for `key`, oldest first, without removing them. */
+  peek(key: string): readonly { ticketId: string; assignmentId: string }[] { return this.waiting.get(key) ?? [] }
+  /**
+   * The next parked launch of `key`, removed from the queue, when that Workspace is free.
+   * @param key - the Workspace lease key.
+   * @param busy - whether that Workspace still holds another ticket's worker.
+   * @returns the launch to re-enqueue, or undefined while the Workspace stays busy.
+   */
+  next(key: string, busy: () => boolean): { ticketId: string; assignmentId: string } | undefined {
+    const queue = this.waiting.get(key)
+    if (queue === undefined || queue.length === 0 || busy()) return undefined
+    const [head, ...rest] = queue
+    if (rest.length === 0) this.waiting.delete(key)
+    else this.waiting.set(key, rest)
+    return head
+  }
+}
+
+/**
+ * The Workspace lease key of a worker's Workspace: the ticket directory in one spelling, so two tickets aimed at the
+ * same directory cannot run at once while different directories run in parallel. `''` means "no Workspace known", which
+ * never blocks a launch.
+ * @param directory - the ticket's target directory, when its execution metadata names one.
+ * @returns a comparable key, or `''`.
+ */
+export function workspaceKeyOf(directory: string | undefined): string {
+  if (directory === undefined || directory.trim() === '') return ''
+  const absolute = resolve(normalize(directory)).replace(/[\\/]+$/, '')
+  return process.platform === 'win32' ? absolute.toLowerCase() : absolute
 }
 
 /**
@@ -238,6 +309,8 @@ export class DshExecutor implements Executor {
   private readonly borrowedClaims = new Map<string, number>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
+  /** Launches parked because another worker already holds their Workspace, oldest first per Workspace key. */
+  private readonly parking = new WorkspaceParking()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
   constructor(private readonly host: ExecutorHost) {
     this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
@@ -247,6 +320,14 @@ export class DshExecutor implements Executor {
       retry: [5000, 300_000] })
     // Failed input deliveries are recorded on the ticket itself rather than reported through the `delivery` effect health entry (`quiet: true`).
     host.effects.handle('delivery', payload => this.deliverQueued(payload.ticketId), { limit: () => host.paused() ? 0 : 4, quiet: true })
+    // Parked launches wait for their Workspace to free; a tick keeps them moving when a worker ends without an idle event.
+    this.tickWorkspaces()
+  }
+  /** Drains parked launches now and again in five seconds, so a Workspace that frees is reused promptly. */
+  private tickWorkspaces(): void {
+    if (this.host.closing()) return
+    this.drainWorkspaces()
+    this.after(5000, () => this.tickWorkspaces())
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
@@ -285,6 +366,10 @@ export class DshExecutor implements Executor {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
+    // One worker per Workspace: a launch waits its turn there instead of holding a global slot, so other Workspaces
+    // keep running. Parking also means a long worker cannot starve the queue for unrelated directories.
+    const key = this.workspaceKey(ticketId)
+    if (this.workspaceBusy(key, ticketId)) { this.park(key, ticketId, assignmentId); return }
     this.slots.reserve(ticketId, 'launch')
     this.launching.add(ticketId)
     try {
@@ -301,6 +386,32 @@ export class DshExecutor implements Executor {
       if (!(error instanceof PrepareFailed) && this.retries(`launch:${assignmentId}`, error)) throw error
       this.launchFailed(ticketId, assignmentId, error)
     } finally { this.launching.delete(ticketId); this.slots.free(ticketId) }
+  }
+  /** The Workspace lease key of a ticket's worker, or `''` when its execution metadata names no directory. */
+  private workspaceKey(ticketId: string): string {
+    return workspaceKeyOf(this.host.store.tickets.get(ticketId)?.execution?.directory)
+  }
+  /** Whether another ticket already holds a slot in Workspace `key`; `''` never conflicts. */
+  private workspaceBusy(key: string, ticketId: string): boolean {
+    if (key === '') return false
+    for (const other of this.slots.occupants()) {
+      if (other !== ticketId && this.workspaceKey(other) === key) return true
+    }
+    return false
+  }
+  /** Parks a launch behind the worker that holds its Workspace. */
+  private park(key: string, ticketId: string, assignmentId: string): void {
+    this.parking.park(key, ticketId, assignmentId)
+  }
+  /** Re-enqueues the next parked launch for every Workspace that has freed, oldest first. */
+  private drainWorkspaces(): void {
+    for (const key of this.parking.keys()) {
+      const next = this.parking.next(key, () => this.workspaceBusy(key, ''))
+      if (next === undefined) continue
+      const ticket = this.host.store.tickets.get(next.ticketId)
+      if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== next.assignmentId) continue
+      this.host.effects.enqueue('launch', next.assignmentId, next)
+    }
   }
   /**
    * Delivers queued inputs to a running assignment one by one, re-reading ticket state before each delivery so delivery
@@ -331,7 +442,7 @@ export class DshExecutor implements Executor {
         try {
           // Only owned worker sessions may be recreated; a missing loan fails delivery.
           if (!ticket.execution?.borrowedSession && !this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', workerTitle(ticket), 'worker')
+            await this.host.sessions.ensureWorker(sessionId, workerTitle(ticket), ticket.execution?.directory ?? '')
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -469,7 +580,7 @@ export class DshExecutor implements Executor {
         if ('error' in result) throw result.error
         return result.agent
       })
-      : await this.host.sessions.ensure(sessionId, workspace, workerTitle(ticket), 'worker')
+      : await this.host.sessions.ensureWorker(sessionId, workerTitle(ticket), workspace)
     if (!current()) return
     if (ticket.execution?.borrowedSession) await this.host.sessions.borrow(agent, ticket)
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.

@@ -3,7 +3,8 @@
  *
  * The rows come from durable Session headers, never from the `agentPreset` projection: the shipped 常驻 conversation
  * projects `standard` while its header says `dsh-superagent-router`, so a projection-based filter would drop the one
- * conversation the group exists for. These cases pin the header rule, the lineage rule, and the worker exclusion.
+ * conversation the group exists for. These cases pin the membership rule (router conversations only — a worker stays in
+ * the Workspace it works in), the lineage rule, and the exclusion of every other conversation or agent.
  */
 import { describe, expect, it } from 'vitest'
 import { SESSION_FORMAT_VERSION, type SessionHeader } from '@deepseek-ai/dsh-session'
@@ -11,6 +12,8 @@ import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/typ
 import { ROUTER_PRESET, WORKER_PRESET, selectRouterSessions } from '../src/app/router-sessions.ts'
 
 const MASTER = 'session-1b84c2b5-d08d-457b-8737-f8879efbfb05'
+/** The worker conversation this machine keeps running, used below as the real shape of a Session the group must ignore. */
+const DEMO_WORKER = 'worker-3e7503559090ac72f7c4d26f95654fee'
 
 /** A stored header with the fields the selection reads; the rest are the format's own defaults. */
 function header(id: string, fields: Partial<SessionHeader> = {}): SessionHeader {
@@ -51,13 +54,68 @@ describe('selectRouterSessions', () => {
     expect(rows.map(row => row.sessionId)).toEqual([MASTER])
   })
 
-  it('never admits an Executor Session, preset or id prefix, even when the router seeded it', () => {
+  it('never admits a worker, whether the preset, the id prefix or the title says so', () => {
+    // The person's rule: a worker is an ordinary conversation in the Workspace its ticket works in, and it is listed
+    // there. The Router group is the router's own list, so none of these identities may pull a worker into it.
     const workerPreset = 'session-worker-preset'
     const workerNamed = 'worker-1a2b3c4d'
     const rows = selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET }),
-      header(workerPreset, { agentPreset: WORKER_PRESET, parentSession: MASTER as SessionHeader['id'] }),
-      header(workerNamed, { parentSession: MASTER as SessionHeader['id'] })], [], MASTER)
+      header(workerPreset, { agentPreset: WORKER_PRESET, cwd: 'S:\\work\\repo' }), header(workerNamed)],
+      [summary(workerPreset, { title: 'worker-t-9f2c1a · 修一' }), summary(workerNamed)], MASTER)
     expect(rows.map(row => row.sessionId)).toEqual([MASTER])
+  })
+
+  it('leaves a worker out even when the title it projects is the worker title', () => {
+    const titled = 'session-titled-worker'
+    const rows = selectRouterSessions([header(titled, { cwd: 'S:\\work\\repo' })],
+      [summary(titled, { title: 'worker-t-9f2c1a · 修一' })])
+    expect(rows).toEqual([])
+  })
+
+  it('leaves this machine\'s running worker out, so it keeps the row in its own Workspace', () => {
+    const rows = selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET }),
+      header(DEMO_WORKER, { agentPreset: WORKER_PRESET, cwd: 'S:\\deepseek_harness' })],
+      [summary(MASTER, { title: 'Router（常驻）' }),
+        summary(DEMO_WORKER, { title: 'worker-3e750355 · 预览联调', running: true })], MASTER)
+    expect(rows.map(row => row.sessionId)).toEqual([MASTER])
+  })
+
+  it('reports a router conversation\'s running state from the host list, so the group can show running or idle', () => {
+    const busy = 'session-router-busy'
+    const rows = selectRouterSessions([header(busy, { agentPreset: ROUTER_PRESET })],
+      [summary(busy, { title: 'Router（副）', running: true })])
+    expect(rows[0]).toMatchObject({ sessionId: busy, running: true, title: 'Router（副）' })
+  })
+
+  it('leaves every ordinary conversation and every other agent\'s Session out', () => {
+    const plain = 'session-plain'
+    const otherAgent = 'session-other-agent'
+    const lookalike = 'session-workerish'
+    const rows = selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET }),
+      header(plain), header(otherAgent, { agentPreset: 'some-other-plugin-agent' }),
+      // A title that merely mentions a worker is not one either: the prefix must lead.
+      header(lookalike, { agentPreset: 'standard' })],
+      [summary(MASTER), summary(plain, { title: 'Fix the parser' }), summary(otherAgent, { title: 'Other agent' }),
+        summary(lookalike, { title: 'about worker-tools' })], MASTER)
+    expect(rows.map(row => row.sessionId)).toEqual([MASTER])
+  })
+
+  it('never admits a subagent spawned by a worker, and not the worker that spawned it either', () => {
+    const worker = 'worker-t-abc'
+    const child = 'session-worker-child'
+    const rows = selectRouterSessions([header(worker, { agentPreset: WORKER_PRESET }),
+      header(child, { agentPreset: WORKER_PRESET, origin: 'subagent', parentSession: worker as SessionHeader['id'] })],
+      [summary(worker, { title: 'worker-t-abc · 修三' }), summary(child)], worker)
+    expect(rows).toEqual([])
+  })
+
+  it('lists the router conversations newest first, with the permanent one leading', () => {
+    const olderRouter = 'session-router-older'
+    const newerRouter = 'session-router-newer'
+    const rows = selectRouterSessions([header(olderRouter, { agentPreset: ROUTER_PRESET }),
+      header(MASTER, { agentPreset: ROUTER_PRESET }), header(newerRouter, { agentPreset: ROUTER_PRESET })],
+      [summary(MASTER, { updatedAt: 1 }), summary(olderRouter, { updatedAt: 9_000 }), summary(newerRouter, { updatedAt: 8_000 })], MASTER)
+    expect(rows.map(row => row.sessionId)).toEqual([MASTER, olderRouter, newerRouter])
   })
 
   it('lists the permanent conversation first even when a relative is newer', () => {

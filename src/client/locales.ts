@@ -134,9 +134,15 @@ const TEXT = {
   routerChat: ['常驻对话', 'Permanent conversation'],
   routerWorkspace: ['Router', 'Router'],
   routerWorkspacePage: ['Router 工作区', 'Router workspace'],
-  routerWorkspaceHint: ['只聚合 router 级对话的虚拟工作区：不落盘、不占目录，也不改动任何会话的归属记录。', 'A virtual workspace that aggregates router-level conversations only: nothing is written to disk and no conversation ownership changes.'],
+  routerWorkspaceHint: ['Router 级对话只在这里列出：worker 是它自己工作区里的普通会话，仍留在那个工作区里，不会被搬到这里。不落盘、不占目录，也不改动任何会话的归属记录。', 'Router-level conversations are listed here only: a worker is an ordinary conversation inside the workspace it works in and stays there. Nothing is written to disk and no conversation ownership changes.'],
   routerWorkspaceEntry: ['定位到 Router 工作区分组', 'Locate the Router workspace group'],
   routerWorkspaceAdmin: ['管理面板', 'Admin panel'],
+  routerWorkspaceDegraded: ['读不到 router 会话，已自动取消隐藏：原工作区里那行仍在。', 'Router conversations are unreadable, so nothing is hidden: the row in its own workspace is still there.'],
+  routerWorkspaceRestore: ['恢复显示（本次运行先全部显示）', 'Show all for now'],
+  routerWorkspaceSuppress: ['隐藏分组已列出的会话在原工作区里的重复行（分组折叠、滚出可视区、接口出错或列表为空时自动不隐藏）', 'Hide the duplicate row in its own workspace for the conversations the group lists (not hidden while the group is folded, scrolled out of sight, unreadable or empty)'],
+  routerWorkspaceShown: ['自动隐藏已关闭：原工作区里仍有重复行。', 'Hiding is off, so the duplicate row in its own workspace is still there.'],
+  routerWorkspaceHideAgain: ['重新隐藏', 'Hide it again'],
+  routerWorkspaceSwitchHint: ['取消勾选即「恢复显示（关闭自动隐藏）」：原工作区里的那行会重新出现。', 'Unticking this is "show all (turn hiding off)": the row in its own workspace comes back.'],
   routerWorkspaceEmpty: ['暂无 router 级对话', 'No router-level conversations yet'],
   routerWorkspaceUntitled: ['未命名对话', 'Untitled conversation'],
   routerWorkspaceUnavailable: ['暂时读不到 router 会话（dsh-superagent 未响应）', 'Router conversations are unavailable right now (dsh-superagent did not answer)'],
@@ -799,6 +805,8 @@ const TEXT = {
   'healthCode.feishuCliUnset': ['来源已打开，还没有设置机器人的 lark-cli', HEALTH_TEXT.feishuCliUnset],
   'healthCode.feishuBotMissing': ['等待飞书机器人', HEALTH_TEXT.feishuBotMissing],
   'healthCode.pollFailures': ['连续 {count} 次轮询失败，最近一次：{error}', HEALTH_TEXT.pollFailures],
+  'healthCode.lockWait': ['等待另一个进程释放状态目录锁 {path}，它上次续约在 {age} 前', HEALTH_TEXT.lockWait],
+  'healthCode.lockError': ['状态目录锁 {path} 取不到：{error}', HEALTH_TEXT.lockError],
 } as const satisfies Record<string, readonly [string, string]>
 export type DshSuperagentKey = keyof typeof TEXT
 const language = (index: 0 | 1) => Object.fromEntries(Object.entries(TEXT).map(([key, pair]) => [key, pair[index]])) as Record<DshSuperagentKey, string>

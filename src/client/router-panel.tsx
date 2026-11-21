@@ -8,7 +8,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { RouterSessionRow } from '../app/router-sessions.ts'
-import { loadRouterSessions, revealRouterWorkspace } from './router-workspace.ts'
+import { loadRouterSessions, readSuppressNative, revealRouterWorkspace, setSuppressNative } from './router-workspace.ts'
 import { when, type T } from './text.ts'
 
 /** Props the main-panel seat supplies: this page's translator, the Session opener, and the management-panel route. */
@@ -28,6 +28,8 @@ export interface RouterWorkspacePanelProps {
 export function RouterWorkspacePanel({ t, openSession, openPanel }: RouterWorkspacePanelProps) {
   const [rows, setRows] = useState<readonly RouterSessionRow[]>([])
   const [error, setError] = useState(false)
+  // The operator's own restore switch: off means every native row stays visible, incident or not.
+  const [suppress, setSuppress] = useState(readSuppressNative)
   useEffect(() => {
     let live = true
     const load = (): void => {
@@ -56,6 +58,13 @@ export function RouterWorkspacePanel({ t, openSession, openPanel }: RouterWorksp
       </button>
     </header>
     <p className="dsr-page-hint">{t('routerWorkspaceHint')}</p>
+    {/* The restore switch: the person can always put every native row back, without waiting for a fix. */}
+    <label className="dsr-page-toggle">
+      <input type="checkbox" checked={suppress}
+        onChange={event => { const next = event.target.checked; setSuppress(next); setSuppressNative(next) }} />
+      {t('routerWorkspaceSuppress')}
+    </label>
+    <p className="dsr-page-hint">{t('routerWorkspaceSwitchHint')}</p>
     {rows.length === 0
       ? <p className="dsr-page-note">{error ? t('routerWorkspaceUnavailable') : t('routerWorkspaceEmpty')}</p>
       : <ul className="dsr-page-list">{rows.map(row => <li key={row.sessionId}>

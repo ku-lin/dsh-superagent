@@ -12,6 +12,7 @@ import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, b
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
+import { lockPath, type LockRefusal } from './state-lock.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
@@ -329,6 +330,40 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
       } catch (error) { json(res, ...failure(error)) }
+    } })]
+  return () => { for (const dispose of disposers) dispose() }
+}
+/** What a process waiting for the state directory's lock answers with: the lock it could not take and the health it reports. */
+export interface LockWaitView {
+  readonly refusal: LockRefusal
+  readonly machine: Machine
+  health(): Record<string, Health>
+}
+/**
+ * Serves the management API while another process holds the state directory. Every request answers 503 with the
+ * `runtime` health entry and the lock's holder trace, so the panel says why it is stopped instead of showing the 404s
+ * of routes that were never mounted.
+ */
+export function registerLockWaitHttp(ctx: Context, wait: LockWaitView): () => void {
+  if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
+  // Read per request: the health board keeps the sentence, and how long the lock has been held changes while it lasts.
+  const waiting = () => {
+    const health = wait.health()
+    const runtime = health['runtime']
+    return {
+      error: runtime?.detail || `dsh-superagent is waiting for the state directory lock ${lockPath(wait.machine.stateDir)}`,
+      code: runtime?.code ?? 'lockWait',
+      lock: { path: lockPath(wait.machine.stateDir), attempts: wait.refusal.attempts, waitedMs: wait.refusal.waitedMs,
+        holder: wait.refusal.holder ?? null },
+      health,
+    }
+  }
+  const disposers = [
+    ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
+      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      json(res, 503, waiting())
     } })]
   return () => { for (const dispose of disposers) dispose() }
 }

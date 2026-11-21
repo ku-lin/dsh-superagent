@@ -1,14 +1,19 @@
 /**
  * Router-level Session selection: which stored Sessions the virtual Router workspace lists.
  *
- * Membership is "the conversation itself ran the router preset", read from the durable Session header and never from
- * the `agentPreset` projection. DSH projects the Agent Preset registry's last selection, and the shipped 常驻
- * conversation reads `standard` there while its header still says `dsh-superagent-router` (measured on this machine).
- * A header is immutable, so the selection survives restarts, resumes, and a DSH upgrade that keeps the format.
+ * Membership is read from the durable Session header, never from the `agentPreset` projection. DSH projects the Agent
+ * Preset registry's last selection, and the shipped 常驻 conversation reads `standard` there while its header still says
+ * `dsh-superagent-router` (measured on this machine). A header is immutable, so the selection survives restarts,
+ * resumes, and a DSH upgrade that keeps the format.
  *
- * Derived Sessions are excluded on purpose: a subagent spawned from a router conversation runs `standard` and belongs
- * to whatever it is working on, so listing it here would make the group "conversations the router produced" instead of
- * "router-level conversations". Executor Sessions are excluded for the same reason.
+ * Exactly one kind of conversation belongs to the router: a router-level conversation, whose own header ran the router
+ * preset. The Executor Sessions the router creates are ordinary Sessions inside the ticket's Workspace, and the person
+ * asked for them to stay there — a worker is listed in the Workspace it works in, not in the Router's group. The group is
+ * the router's own list, so a worker row never enters it (whatever its preset, id prefix or projected title says).
+ *
+ * Derived Sessions are excluded on purpose: a subagent spawned from a router or worker conversation runs `standard` and
+ * belongs to whatever it is working on, so listing it here would make the group "conversations the router produced"
+ * instead of "the router's own conversations". Every other conversation — and every other agent's — stays out.
  *
  * The module holds no Context and no I/O: the host joins headers with its Session list, and a unit test drives the
  * selection directly.
@@ -19,12 +24,10 @@ import type { SessionHeader } from '@deepseek-ai/dsh-session'
 
 /** Preset the main Session runs; the bundle's patch defines it. */
 export const ROUTER_PRESET = 'dsh-superagent-router'
-/** Preset an Executor Session runs. Work is not routing, so the virtual workspace never lists one. */
+/** Preset an Executor Session runs. Exported because the Executor creates workers with it; the group does not select on it. */
 export const WORKER_PRESET = 'dsh-superagent-worker'
-/** Id prefix a worker Session is created with since workers became ordinary Sessions. */
-const WORKER_PREFIX = 'worker-'
 
-/** One row of the virtual Router workspace: one conversation that itself ran the router preset. */
+/** One row of the virtual Router workspace: one of the router's own conversations. */
 export interface RouterSessionRow {
   readonly sessionId: string
   /** Projected conversation title; absent until DSH projects one. */
@@ -47,8 +50,13 @@ type Titled = SessionSummary & {
   readonly projections?: { readonly values?: { readonly title?: unknown } }
 }
 
-/** The row's conversation title from whichever seat the host filled, trimmed; undefined when it carries none. */
-function titleOf(summary: SessionSummary | undefined): string | undefined {
+/**
+ * The row's conversation title from whichever seat the host filled, trimmed; undefined when it carries none.
+ *
+ * Exported so a second reader of the same host rows (the client's transcript linkifier, which also reads the management
+ * catalog) uses the one spelling the host actually fills instead of guessing at it.
+ */
+export function sessionTitle(summary: SessionSummary | undefined): string | undefined {
   if (summary === undefined) return undefined
   const titled = summary as Titled
   for (const candidate of [titled.title, titled.projectionValues?.title, titled.projections?.values?.title]) {
@@ -57,39 +65,43 @@ function titleOf(summary: SessionSummary | undefined): string | undefined {
   return undefined
 }
 
-/** Whether a header is an Executor Session: the worker preset, or the id prefix a worker is created with. */
-function isWorker(header: SessionHeader): boolean {
-  return header.agentPreset === WORKER_PRESET || header.id.startsWith(WORKER_PREFIX)
+/** Whether the header is a router-level conversation: the conversation itself ran the router preset. */
+function isRouter(header: SessionHeader): boolean {
+  return header.agentPreset === ROUTER_PRESET
 }
 
-/** Whether a header belongs to a Session a router conversation spawned rather than a router conversation itself. */
+/** Whether a header belongs to a Session a router or worker conversation spawned rather than one of those itself. */
 function isDerived(header: SessionHeader): boolean {
   return header.origin === 'subagent' || header.parentSession !== undefined
 }
 
+/** Newest first, with a stable tie-break so two rows updated in the same millisecond never swap between polls. */
+const newestFirst = (a: RouterSessionRow, b: RouterSessionRow): number =>
+  b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId)
+
 /**
- * Select the Sessions the virtual Router workspace lists: the conversations whose own header ran the router preset.
+ * Select the Sessions the virtual Router workspace lists: the router's own conversations.
  * @param headers - every stored Session header; the durable authority for the preset and lineage.
  * @param summaries - the host's Session list, joined for title, recency and running state; a member it omits still lists
  *   from its header.
  * @param masterId - the permanent Router conversation, which lists first even when it is the oldest.
- * @returns router conversations, newest first, with the permanent one leading.
+ * @returns the router's conversations — the permanent one first, then the rest newest first.
  */
 export function selectRouterSessions(headers: readonly SessionHeader[], summaries: readonly SessionSummary[],
   masterId?: string): RouterSessionRow[] {
   const byId = new Map(summaries.map(summary => [summary.sessionId as string, summary]))
-  // Only the conversation itself counts: a Session the router spawned runs `standard` and works somewhere else.
-  const routers = headers.filter(header => header.agentPreset === ROUTER_PRESET
-    && !isDerived(header) && !isWorker(header))
   const row = (header: SessionHeader): RouterSessionRow => {
     const summary = byId.get(header.id)
-    const title = titleOf(summary)
+    const title = sessionTitle(summary)
     const cwd = header.cwd ?? summary?.cwd
     return { sessionId: header.id, ...title === undefined ? {} : { title }, ...cwd === undefined ? {} : { cwd },
       updatedAt: summary?.updatedAt ?? header.createdAt, running: summary?.running ?? false,
       agentAvailable: summary?.agentAvailable ?? false }
   }
-  return routers.map(row).sort((a, b) =>
-    a.sessionId === masterId ? -1 : b.sessionId === masterId ? 1 : b.updatedAt - a.updatedAt
-      || a.sessionId.localeCompare(b.sessionId))
+  // Only the conversations themselves count, and only those the router itself ran: a Session a router or worker spawned
+  // works somewhere else, and a worker works in the Workspace the person sees it in.
+  const ordered = headers.filter(header => !isDerived(header) && isRouter(header)).map(row).sort(newestFirst)
+  // The permanent conversation leads; the stable sort leaves the rest's own order untouched.
+  return masterId === undefined ? ordered : ordered.sort((a, b) =>
+    a.sessionId === masterId ? -1 : b.sessionId === masterId ? 1 : 0)
 }

@@ -21,7 +21,12 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   const runtime = new Runtime(ctx, machine, restart)
   ctx.effect(() => async () => { await runtime.stop() })
   await runtime.ready
-  ctx.logger.info(runtime.configured() ? 'dsh-superagent ready; the Superagent sidebar entry opens the management panel' : `dsh-superagent is waiting for setup: ${runtime.setupProblem?.detail ?? ''}`)
+  // A state directory another process holds keeps the plugin mounted and its routes answering; the panel reports the wait.
+  ctx.logger.info(runtime.lockWait ? 'dsh-superagent is waiting for the state directory lock of another process; the panel reports the wait'
+    : runtime.configured() ? 'dsh-superagent ready; the Superagent sidebar entry opens the management panel'
+      // A deployment with no Source at all is ready too: nothing polls, and a Ticket a person hands it still runs.
+      : runtime.setup?.sourceless ? 'dsh-superagent ready without a Source: the Router and its workers run, and nothing polls for work'
+        : `dsh-superagent is waiting for setup: ${runtime.setupProblem?.detail ?? ''}`)
 }
 export type { Deployment, DeploymentConfig } from './deployment.ts'
 export * from './core/index.ts'

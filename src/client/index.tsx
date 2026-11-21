@@ -16,6 +16,7 @@ import { PluginConfig, usePageForm } from './deployment.tsx'
 import { en, zh } from './locales.ts'
 import { mountRouterWorkspace, revealRouterWorkspace } from './router-workspace.ts'
 import { RouterWorkspacePanel } from './router-panel.tsx'
+import { loadSessionTitles, mountSessionLinks } from './session-links.ts'
 import type { T } from './text.ts'
 
 type ClientContext = Context & { sessions: ISessions }
@@ -91,6 +92,12 @@ export function apply(ctx: ClientContext): void {
     })
   }
   ctx.effect(() => mountRouterWorkspace({ openSession, t: () => t }), 'dsh-superagent: virtual Router workspace group')
+  // The Router's conversation names the worker it is talking about; that title opens the conversation. DSH's Markdown
+  // renderer drops a `dsh:` link, so the title is matched in the transcript instead (see session-links.ts). The titles
+  // come from the Router's own rows and from the management catalog, because a worker is listed in its Workspace, not in
+  // the Router workspace group.
+  ctx.effect(() => mountSessionLinks(openSession, loadSessionTitles),
+  'dsh-superagent: Session links in the Router conversation')
   // The management panel keeps no rail row: the sidebar now has one Router entry, the Router workspace page, so its
   // constant is reached from that page instead (`selectPanel`), and the registration stays referenced.
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS, inject: () => ({}) },

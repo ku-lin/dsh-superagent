@@ -1,7 +1,8 @@
 /** Formats background notices and steering relays delivered to the main Session via the effect queue. */
 import { randomUUID } from 'node:crypto'
 import { followupOwners, key, liveTicket, type DomainEvent, type Ticket, type WorkerReport } from '../core/index.ts'
-import { triggerMessage } from '../executor/dsh.ts'
+import { executionSessionId, triggerMessage, workerTitle } from '../executor/dsh.ts'
+import { sessionLink } from './session-link.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { repliedTo } from './links.ts'
 import type { Store } from './store.ts'
@@ -104,12 +105,17 @@ export function followupRelay(message: { trigger_id: string },
   return { id: `followup:${message.trigger_id}`, text: JSON.stringify({ kind: 'follow_up', ...message, delivered_to: tickets,
     note: FOLLOWUP_NOTE }) }
 }
+/** The conversation working `ticket`: its title, and the link that opens it from the Router's transcript. */
+function workerOf(ticket: Ticket): { session: string; title: string; link: string } {
+  const session = executionSessionId(ticket), title = workerTitle(ticket)
+  return { session, title, link: sessionLink(session, title) }
+}
 /** Formats a worker report relay for the main Session (truncating summaries over 600 characters behind `ticket/<id>/result`); `replyTo` names the human question trigger it answers. */
 export function resultRelay(ticket: Ticket, state: string, text: string, replyTo?: string): Relay {
   const id = key('worker-result', ticket.id, ticket.updatedAt, text)
   const summary = text.length > 600 ? { summary: text.slice(0, 600), chars: text.length } : { summary: text }
-  const report = { kind: 'worker_report', ticket: brief(ticket), trigger_id: ticket.origin.triggerId, state, ...replyTo ? { answer_to: replyTo } : {},
-    ...summary, read: `ticket/${ticket.id}/result` }
+  const report = { kind: 'worker_report', ticket: brief(ticket), worker: workerOf(ticket), trigger_id: ticket.origin.triggerId, state,
+    ...replyTo ? { answer_to: replyTo } : {}, ...summary, read: `ticket/${ticket.id}/result` }
   return { id: `report:${id}`, text: JSON.stringify(report) }
 }
 /**
@@ -122,7 +128,8 @@ export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' |
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,
-      text: JSON.stringify({ kind: 'worker_attention', ticket: brief(ticket), state: report.state, read: `ticket/${ticket.id}/result` }) }
+      text: JSON.stringify({ kind: 'worker_attention', ticket: brief(ticket), worker: workerOf(ticket), state: report.state,
+        read: `ticket/${ticket.id}/result` }) }
   }
   if (report.state === 'progress' && !report.answers) return undefined
   return resultRelay(ticket, report.state, report.summary, report.answers)
