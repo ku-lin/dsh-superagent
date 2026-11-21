@@ -3,6 +3,9 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/** Recognize persisted absolute path syntax independently of the platform reading it. */
+export const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/
+
 let cached: string | undefined
 export function packageRoot(): string {
   if (cached) return cached

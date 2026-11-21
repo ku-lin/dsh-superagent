@@ -262,6 +262,10 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
+    if (!text.trimStart().startsWith('{')) {
+      surfaces.push({ where: 'orchestrator plain-text input', owner: 'src/app/runtime.ts', role: 'orchestrator', text })
+      continue
+    }
     const value = JSON.parse(text) as Record<string, unknown>
     const kind = String(value.kind ?? Object.keys(value)[0])
     const owner = kind === 'candidate' ? LINKS : kind === 'worker_attention' ? TOOLS : kind === 'worker_report' ? EXECUTOR : NOTICES
