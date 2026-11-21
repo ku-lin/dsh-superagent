@@ -11,8 +11,8 @@ itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
 ## [1.2.7] - 2026-11-21
 
-The Router's right-hand side now carries the Taskboard's task list: what each project has open, and what state every
-task is in. It is a read-only projection of the board another plugin owns.
+The Router's right-hand side now carries the Taskboard's task list, and it is kept current by a push channel instead of
+a timer. A worker that stops because of an error is reported to the Router by a fixed code path, never by a model.
 
 ### Added
 
@@ -21,17 +21,57 @@ task is in. It is a read-only projection of the board another plugin owns.
   rail (280px, one column below 1080px) on the right of the management panel. A project selector and a refresh button
   sit at the top with the time of the read; the summary counts `进行中 / 待审 / 阻塞`; each row carries a status badge
   — todo grey, in progress blue, in review violet, blocked red, done green, canceled struck through — and finished
-  tasks are hidden until "显示已完成" is on. The list polls every 30 seconds, keeps its own switches across a panel
-  remount, and folds to a one-column tab that keeps its count.
-- **The route is read-only and never repairs the board.** Every poll opens `node:sqlite` with `readOnly: true` and
-  closes it in the same call, so it can neither write nor rewrite a WAL; the answer is cached for five seconds because
-  several tabs may poll at once. `?project=<key>` narrows the answer to one project by its key, ignoring case. The
+  tasks are hidden until "显示已完成" is on. It keeps its own switches across a panel remount and folds to a
+  one-column tab that keeps its count.
+- **The route is read-only and never repairs the board.** Every read opens `node:sqlite` with `readOnly: true` and
+  closes it in the same call, so it can neither write nor rewrite a WAL; the answer is cached for five seconds, and a
+  board change clears that cache. `?project=<key>` narrows the answer to one project by its key, ignoring case. The
   board's location is the mounted Taskboard service's own `config.databasePath` when it can be read, then
   `$DSH_HOME/taskboard.sqlite`, then `~/.dsh/taskboard.sqlite`, so a profile that pins an absolute path is followed
   and dsh-superagent keeps no dependency on the Taskboard package.
 - **A board that is not there is a sentence, not an error.** A missing store, an unreadable file or a locked database
   answers `available: false` with one line of detail: the rail shows it and the rest of the panel, including the
   Router conversation, keeps working. No error toast, no thrown request.
+- **A live channel, so the panel stops polling.** `GET /orchestrator/api/stream` is one Server-Sent Events stream per
+  open panel: it opens with a `hello` frame carrying the current revision of every topic, then pushes a `change` frame
+  naming the topic that moved (`tasks`, `tickets`, `failures`, `overview`, `settings`). The host publishes after the
+  write commits, so a rolled-back transaction announces nothing. DSH's own web server already supports this — a prefix
+  route may hold its response open, and its gzip middleware skips `text/event-stream` — so no second listener and no
+  change to `node_modules` were needed. The route is registered separately from the JSON routes: a host that refuses it
+  loses only push updates.
+- **The task rail is event-driven, and says so when it is not.** The thirty-second `GET tasks` poll is gone; the rail
+  reads once on mount and again when the host announces a board change. When the stream cannot open or drops, the rail
+  shows 「已断开：不会自动刷新，请手动刷新」 with a manual refresh button, and **nothing polls in its place** — a silent
+  fallback would hide the very failure that state reports. The connection retries on a bounded backoff, so it recovers
+  by itself once the host is back.
+- **A deterministic failure report, with no model in the loop.** `FailureLog` (`src/app/failures.ts`) records one
+  structured alert per incident and queues it for the Router through the existing `relay` effect, so a stopped Router
+  holds the alert instead of losing it and a restart keeps it. The records are also the answer to
+  `GET /orchestrator/api/worker/failures` (newest first, `?ticket=` and `?kind=` narrow it), which the panel lists as
+  「异常」 beside the Router workspace with the kind, the ticket, the exit code, who reported it and when.
+- **Five code paths record a failure, each because an event said so:** a worker conversation disposed while its
+  assignment still ran (`crash`); a turn the host closed with reason `error` (`turn-error`); `agent/error` that no
+  transient retry covers (`agent-error`, or `exit` when the error carries an exit code); a worker's own
+  `orchestrator_report` of `failed` or `blocked` (`report-failed` / `agent-error`); and a background job that settled
+  `failed` (`exit` with its code, else `crash`). A failed launch adds `launch`, `timeout` (a prepare command that hit
+  its ten-minute bound, judged by the error's cause rather than by its call site) and `exit`.
+- **`scripts/report-failure.mjs`, so an external process reports the same way.** `--ticket`, `--session`, `--kind`,
+  `--detail` and an optional `--exit-code` go to `POST /orchestrator/api/worker/failure`, which is same-origin fenced
+  like every other write (`x-orchestrator-request: 1`, credentials omitted). Exit codes: `0` recorded or deliberately
+  suppressed as a duplicate, `1` the host refused or was unreachable, `2` the arguments were wrong. `--url` selects the
+  host, defaulting to `DSH_SUPERAGENT_URL` or `http://127.0.0.1:3082`. A repeat of the same ticket, session and kind
+  inside sixty seconds answers `{ recorded: false, duplicate: true }` rather than failing, and that window is what keeps
+  one incident's several paths from waking the Router with several alerts.
+
+### Changed
+
+- **The task rail no longer polls.** It reads once on mount, when the host announces a board change, and when a person
+  presses refresh. A burst of announcements costs one request, and an idle panel costs none.
+- **A worker that reports `failed` or `blocked` reaches the failure log in the same transaction as its report**, so the
+  panel's 异常 list and the Router's queue can never disagree with the ticket. The report's own relay is still queued
+  first, so what the main Session reads first is unchanged.
+- **A prepare command's failure keeps its cause.** `PrepareFailed` now carries the original error, which is what lets
+  the log tell a timeout apart from a non-zero exit instead of guessing from the message.
 
 Operator control over the Router conversation: stop it, start it again, and delete the conversations this plugin owns.
 All three writes are audited, require the panel's same-origin request header, and live under `/orchestrator/api/`.
