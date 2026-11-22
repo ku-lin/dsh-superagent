@@ -307,8 +307,25 @@ export class Evals extends EnginePart {
     const at = this.now()
     const basis = { ...evaluation.basis, ...(outcome.rules ? { rules: outcome.rules } : {}) }
     const { strength, policyVersion, actor } = evaluation
-    const mandate: Mandate = { strength, policyVersion, basis, actor, scope: outcome.scope }
     const ticketId = key('ticket', evaluation.id)
+
+    // Claims are resolved before the ticket is written, so a declaration outside the project root is
+    // refused here — before any worker exists — rather than at its first write. A throw from this hook
+    // propagates out of `decide`, which is the same path every other validation failure takes.
+    let claims: string[] = []
+    if (outcome.claims?.length) {
+      claims = this.options.resolveClaims
+        ? this.options.resolveClaims(outcome.claims, { id: ticketId, title: outcome.title })
+        : [...outcome.claims]
+    }
+
+    const mandate: Mandate = {
+      strength, policyVersion, basis, actor, scope: outcome.scope,
+      // Copied onto the Mandate rather than read from the Outcome later: the Mandate is the immutable
+      // record of what this accept authorised, and a claim is part of that authorisation. Left absent
+      // when nothing was claimed, so an unclaimed ticket reads as "no opinion" rather than "claims ''".
+      ...(claims.length ? { claims } : {}),
+    }
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
     this.tickets.create(ticketId, decision.id, mandate, evaluation, outcome, at)

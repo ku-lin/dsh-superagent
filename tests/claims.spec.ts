@@ -76,6 +76,18 @@ describe('normalizeClaims', () => {
     expect(() => normalizeClaims([root], root, state)).toThrow(/whole project root/)
   })
 
+  it('refuses the whole root when the root arrives with forward slashes', () => {
+    // Regression: a real host passes `S:/proj`, while `path.resolve` answers `S:\proj`. The two
+    // spellings compared unequal, so `claims: ["."]` was accepted and would have blocked every other
+    // worker. The test above passed only because its root was already canonical on this platform.
+    const slashy = path.resolve('/project').replace(/\\/g, '/')
+    const slashyState = `${slashy}/.dsh-superagent`
+    expect(() => normalizeClaims(['.'], slashy, slashyState)).toThrow(/whole project root/)
+    expect(normalizeClaims([''], slashy, slashyState)).toEqual([])
+    // A real claim still comes back absolute and canonical.
+    expect(normalizeClaims(['src/'], slashy, slashyState)).toEqual([path.join(path.resolve('/project'), 'src')])
+  })
+
   it('refuses a path outside the root', () => {
     expect(() => normalizeClaims(['../elsewhere'], root, state)).toThrow(/inside the project root/)
   })

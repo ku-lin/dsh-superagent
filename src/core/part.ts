@@ -13,6 +13,15 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /**
+   * Turns the claims an assessment declared into the absolute paths to store on the Mandate.
+   *
+   * The Engine does not know the project root — the host does — so normalisation lives here as a hook
+   * rather than inside the accept path. Returning `[]` means "nothing to claim"; throwing is how a
+   * declaration outside the root is refused, which must happen before the ticket exists rather than at
+   * the worker's first write. Absent means claims are stored as declared, unnormalised.
+   */
+  resolveClaims?: (claims: readonly string[], ticket: Pick<Ticket, 'id' | 'title'>) => string[]
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

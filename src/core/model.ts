@@ -129,7 +129,22 @@ export interface Mandate {
   /** How the gate admitted it, for re-validation and audit. */
   basis: MandateBasis
   actor: ActorRef
+  /**
+   * The receiving scope: which Source scope the Trigger arrived through. Not a file path set.
+   *
+   * This is deliberately *not* reused for the paths a ticket may write — `claims` covers that. Reading
+   * `scope` as a write scope was a live confusion here, because the word fits both meanings and only
+   * one of them is true.
+   */
   scope: string
+  /**
+   * Project-relative paths this ticket may write, as declared when it was accepted.
+   *
+   * Optional because tickets accepted before claims existed do not carry it, and inventing an empty
+   * list for them would read as "claimed nothing" rather than "no opinion". A ticket without it is
+   * simply not protected and does not block anyone else.
+   */
+  claims?: string[]
 }
 
 /** Active trigger evaluation on a thread; at most one exists per thread. */

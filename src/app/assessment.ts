@@ -27,6 +27,16 @@ export const AssessmentSchema = z.object({
   title: z.string().min(1).max(160),
   worktree_name: WorktreeNameSchema.optional(),
   scope: z.string().max(1500),
+  /**
+   * Project-relative paths this ticket will write, so a second ticket cannot quietly edit the same file.
+   *
+   * Kept separate from `scope` on purpose. `scope` is the *receiving* scope — which Source scope the
+   * Trigger arrived through — and reading it as a write scope was a live confusion here, because the
+   * word fits both meanings and only one of them is true. Omitting this leaves the ticket unprotected,
+   * which is exactly the behaviour before the field existed, not a new failure.
+   */
+  claims: z.array(z.string().min(1).max(400)).max(20).optional()
+    .describe('For acceptance: project-relative files or directories this ticket intends to write, e.g. ["src/panel/", "docs/a.md"]. Omitting it leaves the ticket unprotected; it neither protects nor blocks anything.'),
   intent_evidence: z.string().trim().min(1).max(700).nullish().describe('For acceptance: the quotes that establish the three facts.'),
   acknowledgement: AcknowledgementSchema.nullish().describe('For acceptance: one sentence in the source language, posted as a reply to the trigger; omit only when a matched rule asks for silence.'),
   reason: z.string().min(1).max(500),

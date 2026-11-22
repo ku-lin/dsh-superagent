@@ -57,19 +57,27 @@ export function normalizeClaims(
       : null
   if (!list) throw new Error('claims must be a list of paths, e.g. ["src/panel/", "docs/a.md"]')
 
+  // Both the root and the state directory are normalised before any comparison. Skipping this made
+  // the "whole root" check fail against real hosts, where the root arrives as `S:/proj` and
+  // `path.resolve` returns `S:\proj`: two spellings of the same directory compare unequal, so
+  // `claims: ["."]` was accepted and would have blocked every other worker. It passed in tests only
+  // because those used an already-canonical path.
+  const normalizedRoot = path.resolve(root)
+  const normalizedState = path.resolve(stateDir)
+
   const out: string[] = []
   for (const entry of list) {
     if (typeof entry !== 'string') throw new Error('every claim must be a path string')
     const trimmed = entry.trim()
     if (!trimmed) continue
-    const absolute = path.resolve(root, trimmed).replace(/[/\\]+$/, '')
-    if (!under(absolute, root)) {
+    const absolute = path.resolve(normalizedRoot, trimmed).replace(/[/\\]+$/, '')
+    if (!under(absolute, normalizedRoot)) {
       throw new Error(`a claim must stay inside the project root ${root}: ${trimmed}`)
     }
-    if (absolute === root) {
+    if (absolute === normalizedRoot) {
       throw new Error('refusing to claim the whole project root — name a directory or file')
     }
-    if (under(absolute, stateDir) && !under(absolute, path.join(stateDir, 'out'))) {
+    if (under(absolute, normalizedState) && !under(absolute, path.join(normalizedState, 'out'))) {
       throw new Error(`${stateDir} is the plugin's own state; only its out/ directory may be claimed`)
     }
     if (!out.includes(absolute)) out.push(absolute)
