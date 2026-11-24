@@ -4,6 +4,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Registers the sidebar's own slot names (`sidebar.footer.action` among them) with the slot registry's type union.
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -14,7 +16,7 @@ import { openKnownSession, SessionNavigationError } from '../navigation.ts'
 import { App } from './app.tsx'
 import { PluginConfig, usePageForm } from './deployment.tsx'
 import { en, zh } from './locales.ts'
-import { mountRouterWorkspace } from './router-workspace.ts'
+import { RouterFooterAction } from './router-footer.tsx'
 import { RouterWorkspacePanel } from './router-panel.tsx'
 import { loadSessionTitles, mountSessionLinks } from './session-links.ts'
 import type { T } from './text.ts'
@@ -60,11 +62,9 @@ export function apply(ctx: ClientContext): void {
       else ctx.logger.warn('dsh-superagent could not open a router Session: %s', String(error))
     })
   }
-  ctx.effect(() => mountRouterWorkspace({ openSession, t: () => t }), 'dsh-superagent: virtual Router workspace group')
   // The Router's conversation names the worker it is talking about; that title opens the conversation. DSH's Markdown
   // renderer drops a `dsh:` link, so the title is matched in the transcript instead (see session-links.ts). The titles
-  // come from the Router's own rows and from the management catalog, because a worker is listed in its Workspace, not in
-  // the Router workspace group.
+  // come from the Router's own rows and from the management catalog, because a worker is listed in its own Workspace.
   ctx.effect(() => mountSessionLinks(openSession, loadSessionTitles),
   'dsh-superagent: Session links in the Router conversation')
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS, inject: () => ({}) },
@@ -76,4 +76,9 @@ export function apply(ctx: ClientContext): void {
       openPanel={() => { props.close(); ctx.layout.selectPanel(PANEL_ID) }} />))
   ctx.slots.inject('plugins.row.config', () => ctx.slots.register({ name: 'plugins.row.config', key: `${ENTRY}#${ENTRY}`, locale: NS },
     (props: PluginConfigViewProps & { t: T }) => <PluginConfig t={props.t} view={props.view} form={props.form} />))
+  // The Router's own door in the sidebar foot. It opens the conversation; it does not list or hide anything, so it can
+  // never disagree with the native group that lists the same conversations.
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: ENTRY, locale: NS },
+    (props: { t: T; wide?: boolean }) => <RouterFooterAction t={props.t} wide={props.wide}
+      openSession={openSession} openPanel={() => { ctx.layout.selectPanel(PANEL_ID) }} />))
 }

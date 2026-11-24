@@ -61,3 +61,41 @@ export function startRouter(): Promise<RouterSwitch> { return call<RouterSwitch>
 export function deleteSession(sessionId: string): Promise<DeleteReport> {
   return call<DeleteReport>(`sessions/${encodeURIComponent(sessionId)}?confirm=true`, { method: 'DELETE' })
 }
+
+/** One managed-Router row as `GET managed-routers` reports it. */
+export interface ManagedRouterRow { routerId: string; projectId: string; sessionId: string; generation: number }
+/** One historical delegation as `GET delegated-sessions` reports it. */
+export interface DelegatedSessionRow { sessionId: string; updatedAt: number; running: boolean; title?: string }
+
+/**
+ * Conversations this deployment still holds that were spawned as subagents instead of routed.
+ *
+ * Read-only: it exists so a person can decide about each one. A Router no longer delegates (the guard refuses it), so
+ * this list only ever shrinks by the deletions a person makes here.
+ */
+export function loadDelegatedSessions(): Promise<DelegatedSessionRow[]> {
+  return call<{ items: DelegatedSessionRow[] }>('delegated-sessions', { method: 'GET' }).then(value => value.items)
+}
+/** What a refresh answers: the new generation, and exactly which archive it committed. */
+export interface RefreshOutcome { identity: ManagedRouterRow; archived: number; sourceId: string }
+
+/** Every Router this host has bound to a project, with the Session that is its current generation. */
+export function loadManagedRouters(): Promise<ManagedRouterRow[]> {
+  return call<{ items: { identity: ManagedRouterRow }[] }>('managed-routers', { method: 'GET' })
+    .then(value => value.items.map(item => item.identity))
+}
+
+/**
+ * Archive one Router's conversation and continue in a clean one.
+ *
+ * `generation` is what makes this safe to retry: the host refuses a refresh whose generation no longer matches, so a
+ * second click after a successful refresh cannot archive the conversation twice. A refusal carries the code the page
+ * localizes — an idle/busy conflict, an unbound Router, or an archive that could not be read completely.
+ * @param routerId - the managed Router to refresh.
+ * @param sessionId - the conversation believed to be its current generation.
+ * @param generation - that conversation's generation, as last read.
+ */
+export function refreshRouter(routerId: string, sessionId: string, generation: number): Promise<RefreshOutcome> {
+  return call<RefreshOutcome>(`managed-routers/${encodeURIComponent(routerId)}/refresh`,
+    { method: 'POST', body: { sessionId, generation } })
+}

@@ -2,10 +2,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
-import { scopeParentOf } from '@deepseek-ai/dsh-scope'
+import { scopeChainOf, scopeParentOf, type ScopeKey } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { realpath } from 'node:fs/promises'
-import { dirname, normalize, resolve as resolvePath, sep } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, realpath, stat } from 'node:fs/promises'
+import { dirname, isAbsolute, normalize, resolve as resolvePath, sep } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
@@ -89,6 +90,10 @@ export interface SessionsHost {
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
   readonly masterId: string
+  /** Server-authoritative project Router binding; absent keeps the legacy single Router behavior. */
+  managedRouter?(sessionId: string): { projectId: string; summary: string } | undefined
+  /** Rechecked at execution time, including for an Agent decorated before a refresh. */
+  managedRouterAllowed?(sessionId: string): boolean
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Whether the Router conversation is stopped, which holds every message bound for it instead of dropping it. */
@@ -97,6 +102,14 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /**
+   * The directory the Router's own conversations live and work in.
+   *
+   * A Workspace validates membership by comparing a Session's stored `cwd` with its own `path` exactly (see `attach`),
+   * so this has to be a real directory registered as its own Workspace. Keeping it out of the project's checkout is what
+   * stops the Router from being accounted to the deployment's Workspace, where every other conversation already sits.
+   */
+  routerDirectory(): string
 }
 
 /**
@@ -104,6 +117,9 @@ export interface SessionsHost {
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+
+/** The sidebar title of the Workspace the Router's conversations live in, instead of its directory's last segment. */
+const ROUTER_WORKSPACE_TITLE = 'Router'
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export { ROUTER_PRESET, WORKER_PRESET }
@@ -129,6 +145,80 @@ const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash
  * profile lacks makes `restrict` throw and the Session cannot resume at all.
  */
 const ROUTER_TOOLS = ['skill', 'read', 'read_image']
+/**
+ * Tools a main Router Session must never call, whatever its tool surface still lists.
+ *
+ * Each of these composes a child Agent and appends a `subagent`-origin Session; a Router that used one stopped being a
+ * router, because the work left the ticket pipeline (no Ticket, no project archive, no row a person can manage).
+ *
+ * The names are the deployment's own, and there are two families:
+ * - `dsh-tool-subagent` mounted as `subagent` (spawn) and `subagent_fork` (fork), `dsh-tool-workflow` (its `agent()`
+ *   steps), and `delegate`, the historical name of DSH's delegation tool.
+ * - AgentTeams, which is mounted here and reaches the same `ctx.subagents` provider: `spawn_teammate` starts a
+ *   continuable child per member, and `team_task_*` drive members that already are such children.
+ *
+ * The second family is why the guard cannot be a name list alone for every profile: it is the one a person can still
+ * see in a Router today (the profile's own 31-tool surface), so leaving it out would refuse nothing that matters.
+ *
+ * `restrict` cannot express any of this: it masks the INHERITED surface only, and these are mounted profile-wide, so
+ * they stay visible in a scope that restricts them. The guard below runs per execution and covers every registration.
+ */
+const ROUTER_FORBIDDEN = ['subagent', 'subagent_fork', 'workflow', 'delegate', 'spawn_teammate'] as const
+/** The reserved PTC presentation transport, which `restrict` refuses to name and which is never a module tool. */
+const RUN_CODE = 'run_code'
+/**
+ * Tool names a Router must NOT inherit, so a mounted module's tools can reach it without widening the boundary.
+ *
+ * `restrict` masks everything a Session INHERITS, so superagent's flat `ROUTER_TOOLS` allow-list hid every tool a
+ * mounted module contributed — the module layer measured exactly that as `reached-but-policy-denied`. The tools were
+ * always reachable; only the mask was wrong.
+ *
+ * A deny-list is used rather than an allow-list naming the module's tools, because the set to hide does not depend on
+ * WHICH module is mounted. `dsh-module-layer` emits no `tools/change`, so anything computed once at decoration time and
+ * naming module tools goes stale: switching `ctf` → `forensics` left the `ctf` names admitted and the `forensics`
+ * names hidden. This list only ever names what must stay out, so a module mounted or swapped later is visible
+ * immediately, with nothing to recompute.
+ *
+ * Both terms come from layers at or BELOW the preset generation, which is precisely why no module can appear in them:
+ * - the global layer, so no profile-wide tool (`bash`, `write`, `subagent`…) is ever reachable;
+ * - the generation's OWN contribution (`schemas(generation) \ schemas(parent(generation))`), so a preset's own tools
+ *   stay as restricted as they were — but `ROUTER_TOOLS` inside it is spared, since the Router keeps those.
+ * A module layer sits ABOVE the generation in `[session, generation, module, …]`, so it is never subtracted.
+ *
+ * @param tools - the tool registry (`ctx.tools`).
+ * @param agent - the Router's scope key (the Agent object, which DSH also uses as the scope key).
+ * @returns the names to deny; never names a module tool.
+ */
+function routerDeniedTools(tools: { schemas(scope?: ScopeKey): { name: string }[] }, agent: ScopeKey): string[] {
+  // A host without schema projection denies nothing extra, so the Router keeps `ROUTER_TOOLS` and its own registrations
+  // exactly as before instead of losing tools to a derivation it cannot perform.
+  if (typeof tools.schemas !== 'function') return []
+  const names = (scope: ScopeKey | undefined): Set<string> => new Set(tools.schemas(scope).map(schema => schema.name))
+  const denied = new Set<string>(names(undefined))
+  // Index 1 of `[session, generation, module, …]`: the preset's generation, whose own tools the Router must not gain.
+  const generation = scopeChainOf(agent)[1]
+  if (generation !== undefined) {
+    const above = names(generation)
+    const below = names(scopeParentOf(generation))
+    for (const name of above) if (!below.has(name)) denied.add(name)
+  }
+  for (const name of ROUTER_TOOLS) denied.delete(name)
+  // `restrict` refuses to name the reserved PTC transport at all, and under PTC mode it is present in the global view this
+  // derivation read, so it has to be dropped here or the whole restriction throws and the Session goes undecorated.
+  denied.delete(RUN_CODE)
+  return [...denied].sort()
+}
+/**
+ * The Router's deny list, exposed for the test that pins the scope-chain interaction.
+ * @param tools - the tool registry.
+ * @param agent - the Router's scope key.
+ * @returns the names a Router must not inherit.
+ */
+export const routerDeniedToolsForTest = routerDeniedTools
+/** What a Router is told when it reaches for delegation: the route that keeps the work manageable. */
+const ROUTE_NOT_DELEGATE = 'This Router dispatches work instead of spawning it: call orchestrator_worker_create to open '
+  + 'an ordinary worker conversation, orchestrator_worker_message to talk to an existing one, or orchestrator_route '
+  + 'to accept a source candidate. Do not create delegated child Sessions.'
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with their output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -174,7 +264,7 @@ export class Sessions {
     // Deliver relays and notices to the main Session in the order they were queued. A relay is held while the Router is
     // stopped: steering would start the Router's turn, and a queued one would too, so both kinds wait in the durable queue
     // instead — the row survives a restart, and a start hands it over in arrival order.
-    host.effects.handle('relay', ({ text, queue }, requestId) => this.prompt(host.masterId, requestId, text, queue ? 'queue' : 'steer'),
+    host.effects.handle('relay', ({ text, queue, sessionId }, requestId) => this.prompt(sessionId ?? host.masterId, requestId, text, queue ? 'queue' : 'steer'),
       { ordered: true, limit: () => host.routerStopped() ? 0 : 1 })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
@@ -199,7 +289,27 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        // A Router is a Router whoever started it. DSH may stamp the profile's default preset on a conversation a person
+        // opened by choosing Router in the picker, which silently demoted it to an ordinary Session with no dispatch tools
+        // at all — the person then had a "Router" that answered it had no orchestrator_worker_create. Only a Session this
+        // plugin owns (its Router, or a ticket's worker) is corrected; another plugin's or a person's own choice is not.
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET
+          : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET
+            : preset !== ROUTER_PRESET && agent !== undefined && this.routed(agent) ? ROUTER_PRESET
+              : undefined
+        // A person choosing Router is the one case that cannot be corrected by re-selecting later: DSH refuses `select()`
+        // once the Session has started a turn (`agent-preset/locked`), and the picker choice happens before that turn. So
+        // when the selection IS the router preset, install the router composition here instead of asking for a change.
+        if (preset === ROUTER_PRESET && ticketId === undefined && agent !== undefined && sessionId !== this.host.masterId) {
+          // Release first: a Session can be re-composed in place, so a binding left from an earlier composition would keep
+          // its tools, prompt section and guards and make `decorate` return early — leaving this Router with the previous
+          // (non-Router) surface. `release` is LIFO and idempotent, and a fresh decorate follows.
+          this.release(agent)
+          this.decorate(agent).catch((error: unknown) => ctx.logger.warn('dsh-superagent could not compose the Router Session: %s', String(error)))
+          return
+        }
+        // Picking anything else releases what this plugin installed: its tools and guards belong to the role it had.
+        if (preset !== ROUTER_PRESET && agent !== undefined && this.bindings.has(agent)) this.release(agent)
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -306,6 +416,109 @@ export class Sessions {
     const workspace = await this.workspaceFor(directory)
     return this.ensure(id, title, 'worker', workspace.id)
   }
+  /**
+   * The Workspace the Router's own conversations belong to: the registered one whose path is the Router's directory.
+   *
+   * The Router is a conversation about the deployment, not a conversation inside the project, so it gets its own
+   * directory rather than `process.cwd()`. Membership is exact — a Workspace only accounts for a Session whose stored
+   * `cwd` equals its own `path` — which is why this resolves the exact match instead of the deepest containing one: the
+   * project checkout would otherwise claim the Router, because the Router's directory sits inside it nowhere at all.
+   * Creating it is the same act as a person opening that directory, and it is idempotent: the registry answers the
+   * existing record for a path it already holds.
+   */
+  /** The Router's own Workspace directory, before it is resolved: what a row's `cwd` is compared with. */
+  routerDirectory(): string { return this.host.routerDirectory() }
+  async routerWorkspace(): Promise<{ id: string; path?: string } | undefined> {
+    const wanted = await canonicalPath(this.host.routerDirectory())
+    try { await mkdir(wanted, { recursive: true }) } catch (error) { this.ctx.logger.warn('dsh-superagent could not create the Router workspace directory: %s', String(error)) }
+    // An exact path match only: `nearestWorkspace` would hand back a parent and leave the Router accounted elsewhere.
+    let exact: { id: string; path?: string } | undefined
+    try {
+      const listed = [...await this.ctx.workspaceRegistry.list()]
+      exact = listed.find(item => item.path !== undefined && samePath(item.path, wanted))
+    } catch { /* A host that cannot list still gets the directory registered below. */ }
+    const workspace = exact ?? await this.ctx.workspaceRegistry.create(wanted)
+    await this.nameRouterWorkspace(workspace.id)
+    return workspace
+  }
+  /**
+   * Name the Router's Workspace after the Router, and only when the Workpace still carries its default name.
+   *
+   * A fresh Workspace is titled after its directory's last segment, which would show the group as `router-workspace`.
+   * A title a person chose is left alone, so this is idempotent rather than a rename on every start.
+   * @param workspaceId - the Router's Workspace.
+   */
+  private async nameRouterWorkspace(workspaceId: string): Promise<void> {
+    try {
+      const entity = this.ctx.workspaceRegistry.get(workspaceId as never) as
+        { title?: string; path?: string; setTitle?: (title: string) => Promise<void> } | undefined
+      if (entity?.setTitle === undefined) return
+      const fallback = entity.path === undefined ? undefined : entity.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      // Renamed only while it still wears the name the registry gave it: a person's own title wins.
+      if (entity.title !== undefined && entity.title !== fallback) return
+      await entity.setTitle(ROUTER_WORKSPACE_TITLE)
+    } catch (error) { this.ctx.logger.warn('dsh-superagent could not title its Router workspace: %s', String(error)) }
+  }
+  private readonly directLaunches = new Map<string, Promise<{ agent: Agent; from: number; replayed: boolean }>>()
+
+  /** Open a normal conversation without entering the ticket executor or inheriting Router authority. */
+  async createDirectWorker(router: Agent, input: { request_id: string; title: string; directory?: string | undefined; text: string }) {
+    const directory = input.directory ?? router.session.header.cwd
+    if (!directory || !isAbsolute(directory)) throw new Error('Provide an absolute working directory or open the Router in a workspace')
+    const request = key(router.id, input.request_id)
+    const record = KV.sessions.directWorker(request)
+    const signature = key(directory, input.title, input.text)
+    const pending = this.directLaunches.get(request)
+    if (pending) {
+      // Check the durable signature even if a concurrent caller is still resolving the workspace.
+      const result = await pending
+      if (this.host.store.get(record)?.signature !== signature) throw new Error('This request_id already names a different task')
+      return { ...result, replayed: true }
+    }
+    const launch = async () => {
+      let state = this.host.store.get(record)
+      if (state && state.signature !== signature) throw new Error('This request_id already names a different task')
+      if (!state) {
+        // The person names a directory, so a missing one is their mistake to correct: report it as that, not as the
+        // native `ENOENT` a bare realpath would throw into the Router's reply.
+        const path = await realpath(directory).catch(() => undefined)
+        if (path === undefined) throw new Error(`The working directory does not exist: ${directory}`)
+        if (!(await stat(path)).isDirectory()) throw new Error(`The working directory is not a directory: ${directory}`)
+        const registry = this.ctx.workspaceRegistry
+        const workspace = (await registry.list()).find(item => samePath(item.path, path)) ?? await registry.create(path)
+        state = { signature, requestedId: `session-${randomUUID()}`, workspaceId: workspace.id }
+        this.host.store.set(record, state)
+      }
+      if (!state.sessionId) {
+        // If the process stopped after native creation but before recording the response, recover the original ID
+        // instead of asking create() to reuse a now non-blank conversation (which would mint another ID).
+        const workspace = this.ctx.workspaceRegistry.get(state.workspaceId as never)
+        const requested = state.requestedId as SessionId
+        const sessionId = workspace?.sessionIds.includes(requested) ? requested : (await this.ctx.sessionController.create({
+          sessionId: requested, workspaceId: state.workspaceId as never, agentPreset: 'standard',
+        })).sessionId
+        state = { ...state, sessionId }
+        this.host.store.set(record, state)
+      }
+      const resolved = await this.ctx.sessionController.resolveAgent(state.sessionId as SessionId)
+      if ('error' in resolved) throw resolved.error
+      const agent = resolved.agent
+      if (agent.id === router.id || agent.session.header.origin === 'subagent' || agent.session.header.parentSession != null)
+        throw new Error('The host did not return an independent worker conversation')
+      const from = agent.session.snapshotEvents().length
+      const replayed = state.delivered === true
+      if (!replayed) {
+        await this.name(agent, input.title)
+        await this.prompt(agent.id, key('direct-worker-input', request), input.text, 'queue')
+        this.host.store.set(record, { ...state, delivered: true })
+      }
+      return { agent, from, replayed }
+    }
+    const operation = launch()
+    this.directLaunches.set(request, operation)
+    try { return await operation } finally { this.directLaunches.delete(request) }
+  }
+
   /** Add only ticket-scoped tools to a borrowed conversation; preserve its existing preset, prompts, and tools. */
   async borrow(agent: Agent, ticket: Ticket): Promise<void> {
     if (this.host.store.tickets.open().some(current => current.id !== ticket.id
@@ -382,7 +595,9 @@ export class Sessions {
    * @param requestId - idempotency key of this delivery.
    * @param text - the message.
    */
-  routerMessage(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text, queue: true }) }
+  routerMessage(requestId: string, text: string, sessionId?: string): void {
+    this.host.effects.enqueue('relay', requestId, { text, queue: true, ...(sessionId === undefined ? {} : { sessionId }) })
+  }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
   /** Waits for currently runnable `notice` effects to settle and returns `'injected'` if notice `name` has reached the main Session or `'pending'` if it is still queued. */
@@ -446,7 +661,9 @@ export class Sessions {
   private async decorate(agent: Agent): Promise<void> {
     if (this.bindings.has(agent)) return
     const host = this.host
-    const master = agent.id === host.masterId
+    const projectRouter = host.managedRouter?.(agent.id)
+    // Manually selecting Router in the conversation picker must install dispatch tools and execution guards too.
+    const master = agent.id === host.masterId || projectRouter !== undefined || this.routed(agent)
     const ticket = master ? undefined : this.ticketOf(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
@@ -459,7 +676,11 @@ export class Sessions {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      // A project Router is told which project it serves and the latest durable state; it must read a receipt before writing.
+      const project = projectRouter === undefined ? undefined : host.managedRouter?.(agent.id)
+      const projectNote = project === undefined ? '' :
+        `\n\n[project ${project.projectId}]\nBefore this project operation, call the knowledge read of Router ${agent.id} and use its receipt; if it answers a conflict, read again. Latest durable project state (not original conversation text):\n${project.summary || '(empty)'}`
+      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}${projectNote}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
@@ -472,30 +693,52 @@ export class Sessions {
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
+    const toolset = host.tools(agent, ticket)
+    for (const tool of toolset) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      // Only tools this host actually has: a hard-coded list naming a tool the profile lacks (such as `bash` on Windows)
-      // makes `restrict` throw, and the Session then cannot resume at all.
-      const parent = scopeParentOf(agent)
-      const keep = ROUTER_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: keep }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+      // The Router denies the profile's own tools and the preset's own tools, and keeps `ROUTER_TOOLS` plus its own
+      // `orchestrator_*` registrations. Everything a mounted module contributes sits ABOVE the preset generation, so it is
+      // inherited and visible without being named here — which is the fix: a deny-list cannot go stale when a module is
+      // mounted or swapped, and `dsh-module-layer` emits no `tools/change` to recompute an allow-list on.
+      //
+      // Every name here came from this scope's own view, so `restrict` — which validates names against exactly that view —
+      // accepts the whole list.
+      binding.disposers.push(agent.ctx.tools.restrict({ deny: routerDeniedTools(agent.ctx.tools, agent) }),
+        agent.ctx.tools.guard(execution => {
+          // A managed Router's authority can be revoked by a committed refresh while this Agent object is still alive.
+          if (projectRouter !== undefined && host.managedRouterAllowed?.(agent.id) === false)
+            return 'This Router Session has been replaced by a refresh; continue in the new Session'
+          // Delegation is refused by execution, not by the allow-list: `restrict` cannot mask a scope-registered tool,
+          // and a Router that spawns children works outside the ticket pipeline this plugin exists to keep.
+          if ((ROUTER_FORBIDDEN as readonly string[]).includes(execution.name)) return ROUTE_NOT_DELEGATE
+          return noWait(execution, () => this.routed(agent))
+        }))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
     }
   }
   /**
-   * Whether a Session runs the router preset: as DSH's preset registry last selected it, read through the session projection
-   * on a DSH whose registry has no `presetForSession`, else as it was created; `standard`, the safer caps, when unreadable.
+   * Whether this Session currently routes. Asked at decoration time (to decide whether it gets dispatch tools) and by the
+   * wait guard (to decide whether the router preset's short waits apply).
+   *
+   * The durable header counts first, because a person who picked Router before the first message has that preset recorded
+   * at creation while the registry or projection may not answer yet — reading only the registry left such a Session with
+   * just `read`, `skill` and `read_image`, a Router that could not dispatch. A registry that DOES answer still wins: a
+   * Session switched away from the router preset must not keep its caps, which is what the "switched" tests pin down.
    */
   private routed(agent: Agent): boolean {
     try {
+      // Inside the guard: an Agent built without a durable session (a host fixture, or one mid-construction) has no
+      // header at all, and this predicate must answer rather than throw.
+      const recorded = agent.session.header?.agentPreset
       const presets = this.ctx.get('agentPresets') as { presetForSession?: (session: Agent['session']) => string | null } | undefined
       const projections = this.ctx.get('sessionProjections') as { stateOf?: (session: Agent['session'], key: string) => unknown } | undefined
       const selected = typeof presets?.presetForSession === 'function' ? presets.presetForSession(agent.session)
         : projections?.stateOf?.(agent.session, 'agentPreset')
-      return (selected ?? agent.session.header.agentPreset) === ROUTER_PRESET
+      // Only a concrete answer overrides the header; "no answer" falls back to what the Session was created with.
+      if (selected === undefined || selected === null) return recorded === ROUTER_PRESET
+      return selected === ROUTER_PRESET
     } catch { return false }
   }
   /**
@@ -519,10 +762,11 @@ export class Sessions {
    * it is.
    */
   private limitSubagent(agent: Agent): void {
-    let parent = agent.session.header.parentSession
+    // A Session built without a durable log has no header, so there is no parent to walk: nothing to limit.
+    let parent = agent.session.header?.parentSession
     // Up the subagents' parents to the worker, which are loaded while their subagents run.
     for (let depth = 0; parent !== undefined && ticketOfSession(parent) === undefined && depth < 8; depth++) {
-      parent = this.ctx.agents.get(parent)?.session.header.parentSession
+      parent = this.ctx.agents.get(parent)?.session.header?.parentSession
     }
     const ticketId = parent === undefined ? undefined : ticketOfSession(parent)
     if (ticketId === undefined || !this.host.store.tickets.get(ticketId)) return

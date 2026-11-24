@@ -126,6 +126,8 @@ it('points a setup problem at the settings that fix it', async () => {
   const scroll = vi.fn()
   Element.prototype.scrollIntoView = scroll
   await mount()
+  // The panel opens on Router; the setup problem is stated on Overview.
+  await click(tab(zh['tab.overview']))
   expect(text()).toContain(zh.problemSetup)
   expect(text()).toContain(zh['setup.agentCliUnset'])
   // Nothing runs while setup waits, so the Executor says so instead of counting.
@@ -156,6 +158,8 @@ it('shows a failed Feishu bot check as a problem of the Feishu Source only, with
   server.setup = { ...server.setup, feishuProblem: problemOf('feishuBotNotReady', { app: 'cli_bot', status: 'missing' }),
     accounts: { ...server.setup.accounts!, feishu: null } }
   await mount()
+  // The panel opens on Router; the Feishu problem is stated on Overview.
+  await click(tab(zh['tab.overview']))
   expect(text()).toContain(zh.problemSetupFeishu)
   expect(text()).not.toContain('飞书 来源异常')
   await click(find(zh.problemSetupFeishu, 'button, a, [role="button"]'))

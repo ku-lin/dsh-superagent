@@ -38,6 +38,15 @@ export interface RouterSessionRow {
   readonly updatedAt: number
   readonly running: boolean
   readonly agentAvailable: boolean
+  /**
+   * Whether this conversation already lives in the Router's own Workspace, so the sidebar lists it there natively.
+   *
+   * A Router created before that Workspace existed keeps the deployment checkout as its `cwd`, and a Workspace accounts
+   * only for a Session whose stored `cwd` equals its own `path`; DSH refuses to attach one to the other. Those rows are
+   * still Router conversations, so the group lists them and the client hides their duplicate row. A row that is already
+   * at home needs no such hiding, and saying so is what lets the group stop injecting a rule for it.
+   */
+  readonly atHome: boolean
 }
 
 /**
@@ -80,21 +89,36 @@ const newestFirst = (a: RouterSessionRow, b: RouterSessionRow): number =>
   b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId)
 
 /**
+ * One directory spelling, for comparing a Session's `cwd` with the Router's Workspace `path`.
+ *
+ * The registry compares resolved paths, so the two spellings a person or a host may produce for one directory — either
+ * separator, a trailing one, or a different case on Windows — must compare equal here too; anything else would report a
+ * Router as living elsewhere and leave a duplicate row hidden for no reason.
+ */
+const place = (path: string): string => path.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase()
+
+/**
  * Select the Sessions the virtual Router workspace lists: the router's own conversations.
  * @param headers - every stored Session header; the durable authority for the preset and lineage.
  * @param summaries - the host's Session list, joined for title, recency and running state; a member it omits still lists
  *   from its header.
  * @param masterId - the permanent Router conversation, which lists first even when it is the oldest.
+ * @param homeDirectory - the Router's own Workspace directory, compared with each Session's stored `cwd`; omit it and
+ *   every row reports `atHome: false`, which is the safe answer for a deployment whose Router predates that Workspace.
  * @returns the router's conversations — the permanent one first, then the rest newest first.
  */
 export function selectRouterSessions(headers: readonly SessionHeader[], summaries: readonly SessionSummary[],
-  masterId?: string): RouterSessionRow[] {
+  masterId?: string, homeDirectory?: string): RouterSessionRow[] {
   const byId = new Map(summaries.map(summary => [summary.sessionId as string, summary]))
+  const home = homeDirectory === undefined ? undefined : homeDirectory.toLowerCase()
   const row = (header: SessionHeader): RouterSessionRow => {
     const summary = byId.get(header.id)
     const title = sessionTitle(summary)
     const cwd = header.cwd ?? summary?.cwd
-    return { sessionId: header.id, ...title === undefined ? {} : { title }, ...cwd === undefined ? {} : { cwd },
+    // Compared the way the registry compares them, so a trailing separator, a letter's case or a separator spelling
+    // cannot report a Router as being at home when DSH itself would refuse to attach it.
+    const atHome = home !== undefined && cwd !== undefined && place(cwd) === place(home)
+    return { sessionId: header.id, ...title === undefined ? {} : { title }, ...cwd === undefined ? {} : { cwd }, atHome,
       updatedAt: summary?.updatedAt ?? header.createdAt, running: summary?.running ?? false,
       agentAvailable: summary?.agentAvailable ?? false }
   }

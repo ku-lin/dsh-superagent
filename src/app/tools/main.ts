@@ -1,6 +1,7 @@
 /** Main Session tools for routing triggers, assessing candidates, sending replies, and updating settings and prompts. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
@@ -24,7 +25,7 @@ export interface MainToolsHost {
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt' | 'routerMessage'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'prompt' | 'routerMessage' | 'createDirectWorker'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   /** The Router switch and conversation deletion (`orchestrator_router_*`, `orchestrator_session_delete`). */
   readonly control: Pick<Control, 'router' | 'stopRouter' | 'startRouter' | 'deleteSession' | 'sessionKind'>
@@ -195,7 +196,7 @@ function answerAfter(agent: Agent, from: number): string {
  * This is the inter-session conversation the Router runs on: no polling, no timer of its own, and the answer waits in the
  * Router's inbox like any other message a person or a source sends it.
  */
-async function answerLater(host: MainToolsHost, _router: Agent, worker: Agent, from: number, title: string,
+async function answerLater(host: MainToolsHost, router: Agent, worker: Agent, from: number, title: string,
   signal: AbortSignal): Promise<void> {
   const idle = (): boolean => worker.status === 'idle'
   if (!idle()) {
@@ -208,7 +209,7 @@ async function answerLater(host: MainToolsHost, _router: Agent, worker: Agent, f
   const reply = answerAfter(worker, from)
   if (!reply) return
   // Through the Router's own delivery queue, so a stopped Router holds the answer instead of being woken by it.
-  host.sessions.routerMessage(key('worker-answer', worker.id, String(Date.now())), `Answer from ${title}:\n${reply}`)
+  host.sessions.routerMessage(key('worker-answer', router.id, worker.id, String(from)), `Answer from ${title} (${worker.id}):\n${reply}`, router.id)
 }
 /** Resolves when the conversation's turn ends, or false on timeout or when the caller is cancelled. */
 async function untilIdle(agent: Agent, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
@@ -232,6 +233,26 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
+    tool({
+      name: 'orchestrator_worker_create',
+      description: 'On an explicit human request, open a new ordinary DSH conversation and send it the initial assignment. No ticket or source trigger is needed. Reuse the same request_id and arguments when retrying this creation; do not call this for worker replies or injected context.',
+      schema: z.object({
+        request_id: z.string().trim().min(1).max(128).describe('Stable identifier for this requested creation; reuse on retry.'),
+        title: z.string().trim().min(1).max(200),
+        directory: z.string().trim().min(1).optional().describe('Absolute working directory; defaults to the Router conversation directory.'),
+        text: z.string().trim().min(1).max(8000).describe('The assignment requested by the person.'),
+      }).strict(),
+      execute: async (args, signal) => {
+        try {
+          const { agent: worker, from, replayed } = await host.sessions.createDirectWorker(agent, args)
+          if (!replayed) void answerLater(host, agent, worker, from, args.title, signal).catch(error =>
+            host.context.logger.warn('Worker answer relay failed: %s', String(error)))
+          return { session: worker.id, title: args.title, link: sessionLink(worker.id, args.title), delivered: true, replayed }
+        } catch (error) {
+          return { refused: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    }),
     tool({
       name: 'orchestrator_ticket_retry',
       description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',
@@ -413,7 +434,10 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         if ('error' in resolved) return { refused: `Unknown conversation: ${sessionId}` }
         const worker = resolved.agent
         const from = worker.session.snapshotEvents().length
-        await host.sessions.prompt(sessionId, key('router-message', agent.id, String(Date.now())), args.text, 'queue')
+        // A message id must be unique per delivery: two messages sent in the same millisecond are still two messages, and a
+        // shared id would make the second look like a retry of the first and be dropped. `prompt` is still idempotent for a
+        // genuine retry, because a retry re-sends the same call with the same id rather than minting a new one.
+        await host.sessions.prompt(sessionId, key('router-message', agent.id, randomUUID()), args.text, 'queue')
         // The Router does not sit on a timer: by default it hands the message over and the answer comes back to this
         // conversation when the worker's turn ends. A positive `wait_seconds` only shortens the round trip for a caller that
         // wants the answer inline.

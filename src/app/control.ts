@@ -19,6 +19,7 @@ import { readdir, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ROUTER_PRESET } from './router-sessions.ts'
 import type { Store } from './store.ts'
+import type { RouterRegistry } from './router-registry.ts'
 import { KV } from '../kv.ts'
 
 /** Who asked for a control write: the management panel, or a model through one of the `orchestrator_router_*` tools. */
@@ -126,6 +127,9 @@ export class Control {
     if (!confirm) throw new ControlError('confirmRequired', 'Deleting a conversation requires confirm: true')
     const kind = await this.sessionKind(sessionId)
     if (kind === 'router-main') {
+      // The conversation that serves as the Router right now cannot leave the deployment without one. An earlier main
+      // Router that a committed archive-before-refresh has since replaced is deletable like any other router-level
+      // conversation: its text is already in the project knowledge archive, which is what makes deletion safe.
       audit(this.host.store, { action: 'session.delete', target: sessionId, by, ok: false, note: 'routerSession' })
       throw new ControlError('routerSession', 'The Router conversation cannot delete itself', 409)
     }
@@ -158,14 +162,34 @@ export class Control {
    * Which kind of conversation `sessionId` is, or `undefined` when it is not one this plugin may delete.
    * `router-main` names the permanent Router conversation, which is refused rather than deleted.
    */
-  async sessionKind(sessionId: string): Promise<'worker' | 'router' | 'router-main' | undefined> {
-    if (sessionId === this.host.masterId) return 'router-main'
-    if (sessionId.startsWith('worker-')) return 'worker'
+  async sessionKind(sessionId: string): Promise<'worker' | 'router' | 'router-main' | 'delegated' | undefined> {
+    // `masterId` is the live generation of the main Router, so a Session a refresh replaced no longer answers here and
+    // falls through to the durable-header test below.
+    if (sessionId === this.host.masterId()) return 'router-main'
+    if (this.host.ownsWorker?.(sessionId)) return 'worker'
     // A router-level conversation is identified by its durable header, the same authority `GET router-sessions` reads:
     // the `agentPreset` projection can read `standard` for a conversation the router preset composed.
     const stored = await this.host.context.sessionPersistence.list().catch(() => undefined)
     const header = stored?.find(item => item.header.id === sessionId)?.header
-    return header?.agentPreset === ROUTER_PRESET ? 'router' : undefined
+    // A subagent a conversation spawned runs `standard`, not the router preset, so it is classified before the preset
+    // test: `GET delegated-sessions` offers exactly these for the manual cleanup, and a list whose every row the delete
+    // route refuses would be worse than no list at all.
+    if (header?.origin === 'subagent') {
+      const seen = new Set<string>([sessionId])
+      let parent = header.parentSession
+      while (parent && !seen.has(parent) && seen.size <= 16) {
+        seen.add(parent)
+        if (parent === this.host.masterId() || this.host.ownsWorker?.(parent)) return 'delegated'
+        const ancestor = stored?.find(item => item.header.id === parent)?.header
+        if (ancestor?.agentPreset === ROUTER_PRESET && ancestor.origin !== 'subagent') return 'delegated'
+        parent = ancestor?.parentSession
+      }
+      return undefined
+    }
+    if (header?.agentPreset !== ROUTER_PRESET) return undefined
+    // A conversation the managed routers still depend on — the live generation, a staged replacement, or one whose text
+    // no archive holds — keeps its protection. Everything else the archive already preserves may be removed.
+    return this.host.routers?.protectsSession(sessionId) ? 'router-main' : 'router'
   }
   /** Drop the conversation's projection-cache row so a later conversation reusing the id cannot seed from it. */
   private async dropCachedProjections(sessionId: string): Promise<'dropped' | 'absent' | 'unavailable'> {
@@ -189,7 +213,7 @@ export class Control {
 /** What a deletion actually did, so the panel and the audit trail never overstate it. */
 export interface DeleteReport {
   readonly sessionId: string
-  readonly kind: 'worker' | 'router'
+  readonly kind: 'worker' | 'router' | 'delegated'
   /** The host's archive set now hides the conversation and blocks its turns. */
   readonly archived: true
   /** Titles of the Workspaces the conversation was detached from. */
@@ -205,7 +229,12 @@ export type SessionLogRemoval = { readonly state: 'removed'; readonly path: stri
 export interface ControlHost {
   readonly context: Context
   readonly store: Pick<Store, 'get' | 'set' | 'atomic'>
-  readonly masterId: string
+  /** Read on every call: the live main Router moves to a new generation after a committed refresh. */
+  readonly masterId: () => string
+  /** Durable plugin ownership, never inferred from a session ID prefix. */
+  readonly ownsWorker?: (sessionId: string) => boolean
+  /** The managed-Router registry, when one exists: it proves a replaced main Router was archived before deletion. */
+  readonly routers?: Pick<RouterRegistry, 'protectsSession'>
   /** Schedules a pass, which is what dispatches the deliveries a start released. */
   requestPass(): void
   /** The active persistence backend's session root, when it exposes one; the log is removed from it, or kept. */

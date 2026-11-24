@@ -246,7 +246,10 @@ it('lists in the same order in SQLite and in memory, and undoes a failed nested 
   store.close()
 })
 
-it('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
+// POSIX permission bits are the subject here, and Windows has none: `statSync().mode & 0o777` answers 0o666 for every
+// file there whatever the ACL says, so this assertion can only ever fail on that platform. The behaviour is real and
+// unchanged — `Store` still applies 0o700/0o600 — so this is a platform gate, not a test that was removed.
+it.skipIf(process.platform === 'win32')('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
   const path = join(directory, 'state', 'orchestrator.sqlite')
   new Store(path).close()
   expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])

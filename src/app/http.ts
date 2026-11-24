@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
+import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ManagedRouterApi, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import { latestAssignment, liveTicket } from '../core/index.ts'
@@ -35,6 +35,10 @@ import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { FAILURE_KINDS, type FailureKind, type FailureLog, type FailureSource } from './failures.ts'
 import type { StreamHub } from './stream.ts'
 import type { TasksView } from './tasks.ts'
+import { KnowledgeConflict, type KnowledgeReceipt, type KnowledgeSnapshot, type ProjectKnowledge } from './project-knowledge.ts'
+import type { RouterIdentity, RouterRegistry } from './router-registry.ts'
+import type { RouterRefreshOutcome } from './router-session-host.ts'
+import { RouterRefreshRefused } from './router-session-host.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -84,12 +88,46 @@ export interface HttpHost {
   /** The panel's live channel: the change bus, the failure log, and the SSE route that holds a response open. */
   readonly stream: StreamHub
   readonly failures: FailureLog
+  /**
+   * The managed-Router binding and project-knowledge services. Optional on purpose: a host that composes neither (the
+   * HTTP fixtures, or a runtime waiting for another process's state directory lock) still serves every other route, and
+   * the three managed routes answer that the feature is absent instead of throwing during registration.
+   */
+  readonly managed?: ManagedRouters
 }
 /**
- * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
- * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
+ * The durable services behind `managed-routers/*`: the registry owns the explicit Router/Project/Session binding and
+ * the archive-before-refresh, project knowledge reads the snapshot row the receipt pins, and `refresh` runs one
+ * archive-before-refresh through the DSH Session boundary. All are read through their published methods only.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404 | 409, message: string) { super(message) } }
+export interface ManagedRouters {
+  readonly registry: Pick<RouterRegistry, 'get' | 'list' | 'register' | 'read'>
+  readonly knowledge: Pick<ProjectKnowledge, 'snapshot' | 'versions'>
+  /**
+   * Replace the Router's current Session with a fresh one, archiving the complete old log first. Not part of
+   * {@link ManagedRouters} as a required member for the same reason the registry reads are `Pick`s: a fixture states
+   * exactly what it serves, and a host without the boundary answers that the operation is unavailable.
+   */
+  refresh?(routerId: string, sessionId: string, generation: number): Promise<RouterRefreshOutcome>
+}
+/**
+ * What `GET managed-routers/:routerId/knowledge` answers: the identity that authorized the read (including the
+ * generation the caller's Session must still hold), the snapshot at the receipt's revision, and the single-use receipt
+ * an operation must present. The receipt is minted by the registry read, so a caller cannot supply its own.
+ */
+export interface ManagedRouterKnowledgeView {
+  identity: RouterIdentity
+  snapshot: KnowledgeSnapshot
+  receipt: KnowledgeReceipt
+  /** Every state summary this project committed, newest first, each naming the archive it came from. */
+  versions?: { revision: number; summary: string; sourceId: string; routerId: string; createdAt: string }[]
+}
+/**
+ * Represents a client-facing 400, 404, 409 or 503 error raised during management route parsing or lookup.
+ * Route handlers throw it when request bodies are malformed, target records are missing or in conflict, or an optional
+ * host service is not composed; registerHttp serializes its status and message in the HTTP response.
+ */
+class RouteError extends Error { constructor(readonly status: 400 | 404 | 409 | 503, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -119,6 +157,11 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof ControlError) return [error.status, { error: error.message, code: error.code }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
+  // A binding or receipt conflict is a state conflict the caller can resolve by re-reading, never a server fault.
+  if (error instanceof KnowledgeConflict) return [409, { error: error.message }]
+  // A refused refresh names what a caller must do first (drain the Session, retry once the export can be complete);
+  // it is a conflict with the current state, not a fault of this plugin, so it never answers 500.
+  if (error instanceof RouterRefreshRefused) return [error.status, { error: error.message, code: error.code }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
 }
 
@@ -180,10 +223,71 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
 }
 export type PromptsView = ReturnType<typeof promptsView>
 
-interface Input<K extends keyof Api> {
+/**
+ * The managed-Router services, or a refusal when this host composed none (a fixture, or a runtime waiting for the state
+ * directory lock). Answering 503 keeps the panel's other routes working instead of failing registration.
+ */
+function managedOf(runtime: HttpHost): ManagedRouters {
+  if (!runtime.managed) throw new RouteError(503, 'Managed Router knowledge is unavailable on this host')
+  return runtime.managed
+}
+/**
+ * Confirms a project against the only authority this plugin has: the Taskboard's project rows, matched on the stable
+ * `id` the board stores (not the human `key`, which the board itself matches case-insensitively). A board that is
+ * absent, locked or unreadable proves nothing, so it is refused as unavailable rather than treated as "no project".
+ */
+function requireProject(runtime: HttpHost, projectId: string): void {
+  const view = runtime.tasks.read()
+  if (!view.available) throw new RouteError(503, `No authoritative project list: ${view.detail || view.at}`)
+  if (!view.projects.some(project => project.id === projectId))
+    throw new RouteError(404, `Project ${projectId} is not on the Taskboard`)
+}
+/** Identities a call site must state explicitly; nothing is inferred from the caller's transcript or model output. */
+const ManagedRouterRequest = z.object({
+  routerId: z.string().trim().min(1).max(300),
+  projectId: z.string().trim().min(1).max(300),
+  sessionId: z.string().trim().min(1).max(300),
+}).strict()
+const ManagedRouterSessionQuery = z.object({ sessionId: z.string().trim().min(1).max(300) })
+/**
+ * A refresh states the generation it believes the Router is on. `sessionId` is the conversation being replaced and
+ * `generation` is what the caller last read, so a retried or stale request is refused by the registry instead of
+ * replacing a generation the caller never saw.
+ */
+const ManagedRouterRefreshRequest = z.object({
+  sessionId: z.string().trim().min(1).max(300),
+  generation: z.number().int().positive(),
+}).strict()
+/**
+ * Reads one Router's snapshot and receipt so the two describe the same revision.
+ *
+ * The registry mints the receipt inside its own transaction; the snapshot row is read through its own statement, so a
+ * concurrent checkpoint of the same project can land between them. One retry covers that window, and a second miss is a
+ * conflict the caller resolves by reading again rather than an answer whose receipt cannot be used. A discarded attempt
+ * leaves its receipt row unconsumed, which grants nothing: `operate` refuses a receipt whose revision has moved, and no
+ * caller ever sees that id.
+ */
+function readManagedKnowledge(services: ManagedRouters, routerId: string, sessionId: string): ManagedRouterKnowledgeView {
+  for (let attempt = 0; ; attempt++) {
+    const read = services.registry.read(routerId, sessionId)
+    const snapshot = services.knowledge.snapshot(read.identity.projectId)
+    if (snapshot.revision === read.receipt.revision) {
+      // The history travels with the read: a reader that only saw the latest summary could not tell that an earlier,
+      // much larger archive had been summarized and then superseded by a later refresh.
+      const versions = services.knowledge.versions?.(read.identity.projectId)
+      return { identity: read.identity, snapshot, receipt: read.receipt, ...versions === undefined ? {} : { versions } }
+    }
+    if (attempt > 0) throw new KnowledgeConflict('Project information changed while it was read; read it again')
+  }
+}
+
+/** Every route this layer serves: the panel's own `Api` plus the managed-Router knowledge routes. */
+type RouteTable = Api & ManagedRouterApi
+type RouteName = keyof RouteTable
+interface Input<K extends RouteName> {
   params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
 }
-type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
+type Routes = { [K in RouteName]: (input: Input<K>) => RouteTable[K]['response'] | Promise<RouteTable[K]['response']> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
 const limit = (fallback: number, max: number) => z.coerce.number().int().positive().catch(fallback).transform(value => Math.min(max, value))
 const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('open'), offset, limit: limit(20, 1000) })
@@ -259,6 +363,59 @@ function routes(runtime: HttpHost): Routes {
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
     /** What the Router's task-list panel shows: the Taskboard's projects and their tasks, read-only. */
     'GET tasks': ({ query }) => runtime.tasks.read(query.project ?? ''),
+    /**
+     * The managed Routers this host binds, each with the Project it is bound to and the Session that is its current
+     * generation. Read-only; a Router whose registration failed is absent rather than listed half-bound.
+     */
+    'GET managed-routers': () => {
+      const { registry } = managedOf(runtime)
+      const items = registry.list().map(identity => ({ identity }))
+      return { items, total: items.length }
+    },
+    /**
+     * Bind a Router to a project and its first Session. All three identities are stated by the caller; the project must
+     * already exist on the Taskboard (matched by stable id), so a typo cannot create a knowledge bucket nothing owns.
+     * Registering the same triple again is idempotent; a different triple for a known router (or a Session another
+     * Router generation already holds) is a 409.
+     */
+    'POST managed-routers': async ({ body }) => {
+      const { registry } = managedOf(runtime)
+      const request = ManagedRouterRequest.parse(await body(16 * 1024))
+      // Checked before the write so a refused project leaves no binding behind; the registry then re-checks it atomically.
+      requireProject(runtime, request.projectId)
+      const created = registry.get(request.routerId) === undefined
+      const identity = registry.register(request.routerId, request.projectId, request.sessionId)
+      return { identity, created }
+    },
+    /**
+     * Read one managed Router's project snapshot with the receipt an operation must present. The caller's Session is a
+     * required explicit parameter and the registry verifies it is the Router's current generation, so a stale worker
+     * cannot read project context with a superseded identity.
+     */
+    'GET managed-routers/:routerId/knowledge': ({ params, query }) => {
+      const { sessionId } = ManagedRouterSessionQuery.parse(query)
+      return readManagedKnowledge(managedOf(runtime), params.routerId, sessionId)
+    },
+    /**
+     * Replace one Router's current Session with a fresh one, archiving the old log byte-exact before the pointer moves.
+     *
+     * `generation` is required because a refresh is the one operation whose cost grows with what it replaces: a caller
+     * that read the Router must state which generation it believes it holds, so a retried request cannot quietly archive
+     * the wrong conversation. The answer carries the new identity, the exact archive (`sourceId`), and how much text it
+     * held. A refusal is a 409 naming what to do first; a registry conflict is a 409 too; only an unexpected fault is a
+     * 500, and it leaves the old Session, its history and its pointer untouched.
+     *
+     * The success publishes the `router` topic, because the Router group's rows are chosen from the durable headers:
+     * the new generation is a new conversation, and every open panel must re-read the group.
+     */
+    'POST managed-routers/:routerId/refresh': async ({ params, body }) => {
+      const services = managedOf(runtime)
+      if (!services.refresh) throw new RouteError(503, 'Router refresh is unavailable on this host')
+      const request = ManagedRouterRefreshRequest.parse(await body(16 * 1024))
+      const outcome = await services.refresh(params.routerId, request.sessionId, request.generation)
+      runtime.stream.publish('router')
+      return { identity: outcome.identity, archived: outcome.archived, sourceId: outcome.source.sourceId }
+    },
     /** The ordered log of failures a fixed code path recorded; newest last, capped by `FAILURE_LIMIT`. */
     'GET worker/failures': ({ query }) => failureList(runtime, query),
     /**
@@ -333,6 +490,26 @@ function routes(runtime: HttpHost): Routes {
         return lease ? { ...session, leasedToTicketId: lease.id, ticketTitle: lease.title } : session
       }) }
     },
+    /**
+     * Conversations this deployment holds that were spawned as subagents rather than routed.
+     *
+     * Read-only on purpose: the list exists so a person can remove a delegation that left the ticket pipeline, one
+     * conversation at a time, through the ordinary delete contract. Nothing here archives, deletes or rewrites
+     * anything; a Router that never delegates again stops adding rows, and the historical ones stay exactly as they are
+     * until somebody decides about each.
+     */
+    'GET delegated-sessions': async () => {
+      const sessions = await runtime.listDshSessions()
+      const owned = await Promise.all(sessions.filter(session => session.origin === 'subagent')
+        .map(async session => await runtime.control.sessionKind(session.sessionId) === 'delegated' ? session : undefined))
+      const items = owned.filter((session): session is NonNullable<typeof session> => session !== undefined).map(session => {
+        const titled = session as typeof session & { title?: string; projectionValues?: { title?: string } }
+        const title = titled.title ?? titled.projectionValues?.title
+        return { sessionId: session.sessionId, updatedAt: session.updatedAt, running: session.running,
+          ...title ? { title } : {} }
+      }).sort((a, b) => b.updatedAt - a.updatedAt)
+      return { items, total: items.length }
+    },
     'POST tickets/:id/worker-session': async ({ params, body }) => {
       const { sessionId } = z.object({ sessionId: z.string().min(1).max(300) }).strict().parse(await body())
       const existing = store.tickets.get(params.id)
@@ -393,7 +570,7 @@ function match(table: Routes, method: string, segments: string[]) {
     if (verb !== method || !fits) continue
     const params: Record<string, string> = {}
     pattern.forEach((part, index) => { if (part.startsWith(':')) params[part.slice(1)] = decoded(segments[index]!) })
-    return { run: run as (input: Input<keyof Api>) => unknown, params }
+    return { run: run as (input: Input<RouteName>) => unknown, params }
   }
   return undefined
 }

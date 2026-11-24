@@ -30,7 +30,7 @@ describe('selectRouterSessions', () => {
     // The real conversation: header says router, projection says `standard`, and the list row carries no preset.
     const rows = selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET, cwd: 'S:\\deepseek_harness' })],
       [summary(MASTER, { title: 'Router（常驻）' })], MASTER)
-    expect(rows).toEqual([{ sessionId: MASTER, title: 'Router（常驻）', cwd: 'S:\\deepseek_harness',
+    expect(rows).toEqual([{ sessionId: MASTER, title: 'Router（常驻）', cwd: 'S:\\deepseek_harness', atHome: false,
       updatedAt: 2_000, running: false, agentAvailable: true }])
   })
 
@@ -143,5 +143,25 @@ describe('selectRouterSessions', () => {
     expect(rows[0]!.title).toBe('Projected title')
     const untitled = selectRouterSessions([header('session-plain-router', { agentPreset: ROUTER_PRESET })], [])
     expect(untitled[0]!.title).toBeUndefined()
+  })
+
+  /**
+   * The row's `atHome` is what lets the client drop its injected hiding rule for a Router that the sidebar already lists
+   * in the Router's own Workspace. It has to match the way the registry compares a Session's `cwd` with a Workspace's
+   * `path`, including the two spellings that differ without naming a different place.
+   */
+  it('reports a Router at home only when its cwd is the Router workspace itself', () => {
+    const home = 'S:\\deepseek_harness\\.dsh\\state\\superagent\\router-workspace'
+    const at = (cwd: string) => selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET, cwd })], [], MASTER, home)[0]!
+    expect(at(home).atHome).toBe(true)
+    // A trailing separator and a letter's case are not a different directory.
+    expect(at(`${home}\\`).atHome).toBe(true)
+    expect(at(home.toLowerCase().replaceAll('\\', '/')).atHome).toBe(true)
+    // A Router still accounted to the project checkout is the duplicate the client has to hide.
+    expect(at('S:\\deepseek_harness').atHome).toBe(false)
+    // A sibling that merely shares the prefix is not inside it.
+    expect(at(`${home}-other`).atHome).toBe(false)
+    // Without a directory to compare against, nothing claims to be at home: the safe answer for an older host.
+    expect(selectRouterSessions([header(MASTER, { agentPreset: ROUTER_PRESET, cwd: home })], [], MASTER)[0]!.atHome).toBe(false)
   })
 })

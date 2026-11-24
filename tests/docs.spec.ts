@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
@@ -12,8 +12,10 @@ const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8')
 function links(file: string): string[] {
   return [...readFileSync(file, 'utf8').matchAll(/\]\(([^)\s]+)\)/g)].map(match => match[1]!.split('#')[0]!).filter(target => target && !/^[a-z]+:/.test(target))
 }
+// Repo paths are compared with the separators the documents use (forward slashes). `relative` answers with backslashes
+// on Windows, which made every module look undocumented there, so the whole comparison was silently Windows-only wrong.
 const files = (directory: string): string[] => readdirSync(join(ROOT, directory), { recursive: true, withFileTypes: true })
-  .filter(entry => entry.isFile()).map(entry => relative(ROOT, join(entry.parentPath, entry.name)))
+  .filter(entry => entry.isFile()).map(entry => relative(ROOT, join(entry.parentPath, entry.name)).split(sep).join('/'))
 /**
  * Extract repo-relative file paths from the first column of a table under `## <heading>` in `docs/007-architecture.md`.
  * Bare filenames inherit the directory of the preceding path in the same cell.
@@ -28,7 +30,9 @@ function listed(heading: string): string[] {
     let directory = ''
     return [...row.split('|')[1]!.matchAll(/`([^`]+)`/g)].map(([, name]) => {
       if (!name!.includes('/')) return join(directory, name!)
-      directory = dirname(name!)
+      // The document always writes forward slashes, and the inherited directory is compared with them: `dirname` on
+      // Windows would hand back backslashes and every earlier abbreviation in the cell would stop resolving.
+      directory = dirname(name!).split(sep).join('/')
       return name!
     })
   })
@@ -42,7 +46,9 @@ describe('documentation', () => {
     const violations = numbered.flatMap(name => links(join(ROOT, 'docs', name)).flatMap(target => {
       const linked = resolve(ROOT, 'docs', target)
       if (!linked.endsWith('.md')) return []
-      const number = NUMBERED.exec(linked.slice(linked.lastIndexOf('/') + 1))?.[1]
+      // `lastIndexOf('/')` finds nothing in a resolved Windows path, so the name was compared whole and every link into
+      // a numbered document read as a violation there. `basename` answers the same on both platforms.
+      const number = NUMBERED.exec(basename(linked))?.[1]
       return dirname(linked) === join(ROOT, 'docs') && number !== undefined && number < name.slice(0, 3) ? [] : [`${name} → ${target}`]
     }))
     expect(violations).toEqual([])

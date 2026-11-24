@@ -3,7 +3,7 @@ import { bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
@@ -19,7 +19,7 @@ import { TextCache } from '../src/app/cache.ts'
 import { KV } from '../src/kv.ts'
 import { auditTrail } from '../src/app/control.ts'
 import { SettingsSchema, policyVersion, type SettingsOrigin } from '../src/policy.ts'
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind, pollRound } from '../src/sources/github.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -40,7 +40,7 @@ let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
 let directory: string
-let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
+let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn>; list: ReturnType<typeof vi.fn> }
 type RegisteredTool = { name: string; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
 let tools: Map<string, Map<string, RegisteredTool>>
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
@@ -78,6 +78,9 @@ async function receive(trigger: Trigger, target = runtime) {
   return result
 }
 let services: Record<string, unknown>
+/** Every Workspace entity this host's registry made, keyed by directory: its `sessionIds` is the sidebar's only input. */
+let workspaces: Map<string, { id: string; title: string; sessionIds: string[]; detachSession: () => Promise<void>;
+  attachSession: (sessionId: string) => Promise<void> }>
 /** DSH's job registry the Runtime's Executor reads its workers' shell jobs from. */
 let jobs: ReturnType<typeof jobRegistry>
 /** What worker commands of the startup checks print, by argv; an Error makes the command fail with its message. */
@@ -185,11 +188,20 @@ beforeEach(async () => {
           const own = scope === agents.get(sessionId)
           return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
         },
-        restrict: vi.fn((rule: { allow: string[] }) => {
-          if (rule.allow.some(name => !inherited.includes(name))) throw new Error('Restriction names a non-inherited tool')
-          restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule]); return () => {}
+        restrict: vi.fn((rule: { allow?: string[]; deny?: string[] }) => {
+          // An `allow` list must name only inherited tools, as the real `restrict` requires. A `deny` list may name
+          // anything the scope could inherit, and this double projects no schemas, so the Router derives none.
+          if (rule.allow !== undefined && rule.allow.some(name => !inherited.includes(name)))
+            throw new Error('Restriction names a non-inherited tool')
+          restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule])
+          // The real disposer lifts this exact restriction; disposing must drop it, or a release looks like a no-op.
+          return () => { restricts.set(sessionId, (restricts.get(sessionId) ?? []).filter(current => current !== rule)) }
         }),
-        guard: vi.fn((check: Guard) => { guards.set(sessionId, check); return () => {} }) })
+        guard: vi.fn((check: Guard) => {
+          guards.set(sessionId, check)
+          // Likewise: disposing removes the guard it registered, so a released Router leaves no guard behind.
+          return () => { if (guards.get(sessionId) === check) guards.delete(sessionId) }
+        }) })
       agentCtx.reflect.provide('skills', { register: () => () => {} })
       agentCtx.reflect.provide('systemPrompt', { section: (spec: Section) => { sections.set(sessionId, spec); return () => {} } })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
@@ -211,9 +223,22 @@ beforeEach(async () => {
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
+    // The host's session catalog, which the Router panel and the Router workspace route both read for titles and recency.
+    list: vi.fn(async () => ({ items: [] as { sessionId: string; updatedAt: number }[] })),
   }
   jobs = jobRegistry()
-  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }),
+  // Every Workspace this host has made, so a case can assert a created Session was accounted to one. A Session that is
+  // created but never attached is invisible in the sidebar, which is the failure this records against.
+  workspaces = new Map<string, { id: string; title: string; sessionIds: string[]; detachSession: () => Promise<void>;
+    attachSession: (sessionId: string) => Promise<void> }>()
+  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => {
+      const entity = { id: cwd, title: cwd, sessionIds: [] as string[], detachSession: async () => {},
+        attachSession: async (sessionId: string) => { entity.sessionIds.push(sessionId) } }
+      workspaces.set(cwd, entity)
+      return { id: cwd }
+    },
+    // A Workspace entity is what `attachSession` lives on; returning it is what lets the plugin account a Session.
+    get: (id: string) => workspaces.get(id),
     // The host's archive set: deleting a conversation archives it and asks the providers to stop its work.
     archiveSession: vi.fn(async () => {}), list: () => [] as { id: string; title: string; sessionIds: never[]; detachSession: () => Promise<void> }[] }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { kind?: string; handler: HttpHandler }) => {
       // Only the management prefix answers these cases; the exact change-stream route is a different contract.
@@ -1071,7 +1096,7 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   await broken.ready
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(join(directory, 'worker-bin'))
+  expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
@@ -1085,13 +1110,16 @@ it('writes worker shims and the agent environment from the configuration only, a
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
-  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${credentialHelper(AGENT())}"`)
+  // A quoted git-config value escapes backslashes, so a Windows CLI path is written with doubled separators. The
+  // expectation has to apply the same escaping; comparing the raw path only ever matched on POSIX.
+  const quoted = credentialHelper(AGENT()).replace(/[\\"]/g, char => `\\${char}`)
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${quoted}"`)
   expect(process.env).toMatchObject({ GIT_CONFIG_GLOBAL: workerGitConfig(directory), GIT_CONFIG_NOSYSTEM: '1' })
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
-  expect(process.env.PATH?.split(':')[0]).toBe(bin)
+  expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
   await next.stop()
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(bin)
+  expect(process.env.PATH?.split(delimiter)).not.toContain(bin)
 })
 
 it('waits for setup when the shim directory holds a file dsh-superagent did not write, and leaves the file alone', async () => {
@@ -1690,6 +1718,235 @@ it('refuses the main Session a bash command that runs sleep and a long job wait,
   expect(masterPrompt).toContain('Worker reports, follow_up notices, new candidates and a background job\'s end, with its output, arrive by themselves as messages')
 })
 
+it('renders only the current project knowledge in each project Router prompt', async () => {
+  const create = controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  const render = (id: string) => sections.get(id)!.text({})
+  const save = (router: string, summary: string) => runtime.knowledge!.checkpoint(runtime.knowledge!.read(router).receipt, [], summary)
+  for (const [router, project, session, summary] of [
+    ['r-isolation-a', 'project-isolation-a', 'session-isolation-a', 'A durable {{literal}}'],
+    ['r-isolation-b', 'project-isolation-b', 'session-isolation-b', 'B durable state'],
+  ] as const) {
+    runtime.routers!.register(router, project, session)
+    save(router, summary)
+    await create({ sessionId: session, agentPreset: 'dsh-superagent-router' })
+    await ctx.parallel('agent/created', { agent: agents.get(session) } as never)
+  }
+  const manual = 'session-isolation-manual'
+  await create({ sessionId: manual, agentPreset: 'dsh-superagent-router' })
+  await ctx.parallel('agent/created', { agent: agents.get(manual) } as never)
+  expect(render('session-isolation-a')).toContain('[project project-isolation-a]')
+  expect(render('session-isolation-a')).toContain('A durable {{literal}}')
+  expect(sections.get('session-isolation-a')).toMatchObject({ interpolate: false })
+  expect(render('session-isolation-a')).toContain('use its receipt')
+  expect(render('session-isolation-a')).not.toContain('B durable state')
+  expect(render('session-isolation-b')).toContain('B durable state')
+  expect(render('session-isolation-b')).not.toContain('project-isolation-a')
+  expect(render(manual)).not.toContain('[project ')
+  save('r-isolation-a', 'A updated state')
+  expect(render('session-isolation-a')).toContain('A updated state')
+  expect(render('session-isolation-a')).not.toContain('A durable')
+})
+
+it('creates and dispatches a direct ordinary worker once, using the native returned ID', async () => {
+  const create = controller.create.getMockImplementation()! as (args: object) => Promise<void>
+  const actual = 'session-host-selected-worker'
+  const nativeCreate = vi.spyOn(controller, 'create').mockImplementationOnce(async (args: { agentPreset: string }) => {
+    await create({ ...args, sessionId: actual })
+    return { sessionId: actual, agentPreset: args.agentPreset }
+  })
+  const input = { request_id: 'direct-test', directory, title: 'Direct task', text: 'Return a status note' }
+  const tool = tools.get(runtime.masterId)!.get('orchestrator_worker_create')!
+  const invoke = (args: typeof input) => tool.execute(args, { signal: new AbortController().signal })
+  const [first, duplicate] = await Promise.all([invoke(input), invoke(input)])
+  expect(first).toMatchObject({ session: actual, title: input.title, delivered: true, replayed: false })
+  expect(duplicate).toMatchObject({ session: actual, delivered: true, replayed: true })
+  expect(await invoke(input)).toMatchObject({ session: actual, replayed: true })
+  expect(await invoke({ ...input, text: 'different' })).toMatchObject({ refused: expect.stringContaining('different task') })
+  expect(nativeCreate.mock.calls.filter(([args]) => args.agentPreset === 'standard')).toHaveLength(1)
+  expect(deliveries.mock.calls.filter(([message]) => message.sessionId === actual)).toHaveLength(1)
+  expect(tools.get(actual)?.has('orchestrator_worker_create')).toBe(false)
+})
+
+it('retries a failed native worker creation with the same reserved ID and refuses invalid directories', async () => {
+  const create = controller.create.getMockImplementation()! as (args: object) => Promise<void>
+  controller.create.mockImplementationOnce(async () => { throw new Error('temporary native creation failure') })
+  const input = { request_id: 'retry-direct', directory, title: 'Retry task', text: 'Return status' }
+  const invoke = (args: typeof input) => tools.get(runtime.masterId)!.get('orchestrator_worker_create')!
+    .execute(args, { signal: new AbortController().signal })
+  expect(await invoke(input)).toEqual({ refused: 'temporary native creation failure' })
+  const reserved = controller.create.mock.calls.at(-1)![0].sessionId
+  controller.create.mockImplementationOnce(async (args: { sessionId: string; agentPreset: string }) => {
+    await create(args)
+    return { sessionId: args.sessionId, agentPreset: args.agentPreset }
+  })
+  expect(await invoke(input)).toMatchObject({ session: reserved, delivered: true })
+  expect(deliveries.mock.calls.filter(([message]) => message.sessionId === reserved)).toHaveLength(1)
+  const count = controller.create.mock.calls.length
+  expect(await invoke({ ...input, request_id: 'bad-path', directory: 'relative-path' })).toMatchObject({ refused: expect.stringContaining('absolute') })
+  // A directory that does not exist is the person's to correct, and says so instead of leaking a native ENOENT.
+  const missing = await invoke({ ...input, request_id: 'missing-dir', directory: join(directory, 'no-such-directory') })
+  expect(missing).toMatchObject({ refused: expect.stringContaining('does not exist') })
+  expect(JSON.stringify(missing)).not.toContain('ENOENT')
+  // A file is not a working directory either.
+  const filePath = join(directory, 'a-file.txt')
+  writeFileSync(filePath, 'x')
+  expect(await invoke({ ...input, request_id: 'not-a-dir', directory: filePath }))
+    .toMatchObject({ refused: expect.stringContaining('not a directory') })
+  expect(controller.create.mock.calls).toHaveLength(count)
+})
+
+it('returns a direct worker answer to the originating manual Router, never the master', async () => {
+  const create = controller.create.getMockImplementation()! as (args: object) => Promise<void>
+  const routerId = 'session-origin-router', workerId = 'session-origin-worker'
+  await create({ sessionId: routerId, agentPreset: 'dsh-superagent-router' })
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: agents.get(routerId) } as never)
+  let finish!: () => void
+  const idle = new Promise<void>(resolve => { finish = resolve })
+  controller.create.mockImplementationOnce(async (args: { agentPreset: string }) => {
+    await create({ ...args, sessionId: workerId })
+    const worker = agents.get(workerId)! as unknown as { whenIdle: () => Promise<void> }
+    worker.whenIdle = () => idle
+    return { sessionId: workerId }
+  })
+  const tool = tools.get(routerId)!.get('orchestrator_worker_create')!
+  await tool.execute({ request_id: 'answer-origin', directory, title: 'Origin test', text: 'Report status' },
+    { signal: new AbortController().signal })
+  const worker = agents.get(workerId)! as unknown as {
+    status: string; session: { append: (type: string, data: unknown) => void }
+  }
+  worker.session.append('assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: 'Completed origin task' }] } })
+  worker.status = 'idle'
+  finish()
+  await Promise.resolve()
+  await runtime.idle()
+  const answers = deliveries.mock.calls.map(([message]) => message).filter(message => message.text.includes('Completed origin task'))
+  expect(answers).toHaveLength(1)
+  expect(answers[0]!.sessionId).toBe(routerId)
+  expect(answers[0]!.sessionId).not.toBe(runtime.masterId)
+})
+
+it('keeps the created worker usable when the first delivery fails, and delivers it on retry', async () => {
+  const create = controller.create.getMockImplementation()! as (args: object) => Promise<void>
+  const sessionId = 'session-delivery-retry'
+  controller.create.mockImplementationOnce(async (args: { sessionId: string; agentPreset: string }) => {
+    await create({ ...args, sessionId })
+    return { sessionId }
+  })
+  const input = { request_id: 'delivery-retry', directory, title: 'Delivery retry', text: 'Do the work' }
+  const invoke = (args: typeof input) => tools.get(runtime.masterId)!.get('orchestrator_worker_create')!
+    .execute(args, { signal: new AbortController().signal })
+  // The conversation exists after this failure; a retry must reuse it rather than create a second one.
+  const failing = vi.spyOn(controller, 'resolveAgent').mockRejectedValueOnce(new Error('host was busy'))
+  expect(await invoke(input)).toMatchObject({ refused: expect.stringContaining('host was busy') })
+  failing.mockRestore()
+  const created = controller.create.mock.calls.length
+  expect(await invoke(input)).toMatchObject({ session: sessionId, delivered: true })
+  expect(controller.create.mock.calls).toHaveLength(created)
+  expect(deliveries.mock.calls.filter(([message]) => message.sessionId === sessionId)).toHaveLength(1)
+})
+
+it('sends two messages in the same millisecond as two deliveries, not one', async () => {
+  const worker = 'session-two-in-a-row'
+  const create = controller.create.getMockImplementation()! as (args: object) => Promise<void>
+  await create({ sessionId: worker, agentPreset: 'standard' })
+  const tool = tools.get(runtime.masterId)!.get('orchestrator_worker_message')!
+  const signal = new AbortController().signal
+  // `resolveWorker` reads the host's own conversation list; the double provides the one row being addressed.
+  ;(controller as unknown as Record<string, unknown>).list = vi.fn(async () => ({ items: [{ sessionId: worker, running: false, agentAvailable: true, title: 'Two in a row' }] }))
+  // Same millisecond on purpose: a time-based id would make the second look like a retry of the first.
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+  try {
+    await tool.execute({ session: worker, text: 'first' }, { signal })
+    await tool.execute({ session: worker, text: 'second' }, { signal })
+  } finally { now.mockRestore() }
+  const texts = deliveries.mock.calls.map(([message]) => message.text).filter(text => text === 'first' || text === 'second')
+  expect(texts).toEqual(['first', 'second'])
+  expect(new Set(deliveries.mock.calls.map(([message]) => message.id)).size).toBe(deliveries.mock.calls.length)
+})
+
+it('decorates a manually created Router with dispatch tools and delegation guards', async () => {
+  const sessionId = 'session-manual-router'
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId, agentPreset: 'dsh-superagent-router' })
+  const agent = agents.get(sessionId)!
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent } as never)
+  expect(tools.get(sessionId)?.has('orchestrator_worker_message')).toBe(true)
+  expect(tools.get(sessionId)?.has('orchestrator_route')).toBe(true)
+  const guard = guards.get(sessionId)
+  expect(guard).toBeTypeOf('function')
+  for (const name of ['subagent', 'subagent_fork', 'workflow', 'delegate', 'spawn_teammate'])
+    expect(guard!({ name, arguments: {} })).toMatch(/^This Router dispatches work instead of spawning it/)
+  expect(guard!({ name: 'orchestrator_worker_message', arguments: {} })).toBeUndefined()
+})
+
+it('reads the Router role from the durable header when the preset registry cannot answer yet', async () => {
+  // Reproduces the live failure: a person picked Router in the picker and sent a message at once, so decoration ran while
+  // the registry/projection still answered nothing. The Session then kept only read/skill/read_image and could not
+  // dispatch at all — a Router that could not route.
+  const sessionId = 'session-header-router'
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId, agentPreset: 'dsh-superagent-router' })
+  const agent = agents.get(sessionId)!
+  const ctx = (runtime as unknown as { ctx: Context }).ctx as unknown as
+    { get: (name: string) => unknown; parallel: Context['parallel'] }
+  const realGet = ctx.get.bind(ctx)
+  // Answer "no registry, no projection" for exactly the two lookups `routed()` makes, then restore.
+  let silenced = 0
+  ctx.get = ((name: string) => {
+    if (name === 'agentPresets' || name === 'sessionProjections') { silenced++; return undefined }
+    return realGet(name)
+  }) as typeof ctx.get
+  try {
+    await ctx.parallel('agent/created', { agent } as never)
+  } finally { ctx.get = realGet as typeof ctx.get }
+  // The registry is asked and answers nothing — which is exactly the live condition — and the header decides.
+  expect(silenced).toBeGreaterThan(0)
+  expect(tools.get(sessionId)?.has('orchestrator_worker_create')).toBe(true)
+  expect(tools.get(sessionId)?.has('orchestrator_worker_message')).toBe(true)
+  expect(guards.get(sessionId)!({ name: 'subagent', arguments: {} }))
+    .toMatch(/^This Router dispatches work instead of spawning it/)
+  // And a standard Session still gets no dispatch tools, so this is the router preset rather than any Session.
+  const plain = 'session-header-plain'
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId: plain, agentPreset: 'standard' })
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: agents.get(plain)! } as never)
+  expect(tools.get(plain)?.has('orchestrator_worker_create') ?? false).toBe(false)
+})
+
+it('answers the routing question instead of throwing when a session has no durable header at all', async () => {
+  // The live crash was `TypeError: Cannot read properties of undefined (reading 'agentPreset')`: a Session built without a
+  // durable log has no `header`, and reading `.header.agentPreset` outside the guard took whole ticket runs down with it.
+  // The header object itself is what has to go — deleting one field only ever yields `undefined` and would pass either way.
+  const sessionId = 'session-no-header'
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId, agentPreset: 'standard' })
+  const agent = agents.get(sessionId)!
+  const session = (agent as unknown as { session: { header?: unknown; snapshotEvents?: unknown } }).session
+  const realHeader = session.header
+  session.header = undefined
+  try {
+    await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent } as never)
+  } finally { session.header = realHeader }
+  // A Session with no header cannot be shown to be a Router: no dispatch tools, no Router guard, and nothing threw.
+  expect(tools.get(sessionId)?.has('orchestrator_worker_create') ?? false).toBe(false)
+  expect(guards.get(sessionId) ?? undefined).toBeUndefined()
+})
+
+it('refuses the main Session delegation and tells it to route instead, while a worker keeps the tool', async () => {
+  const main = guards.get(runtime.masterId)!
+  // DSH mounts these profile-wide, so `restrict` cannot mask them; the guard is what refuses them per execution. Two
+  // families reach `ctx.subagents`: DSH's own delegation tools, and AgentTeams, whose `spawn_teammate` starts a
+  // continuable child per member — that one is live in this deployment's Router surface today.
+  for (const name of ['subagent', 'subagent_fork', 'workflow', 'delegate', 'spawn_teammate']) {
+    expect(main({ name, arguments: { prompt: 'do the thing' } }), name)
+      .toMatch(/^This Router dispatches work instead of spawning it: call orchestrator_worker_create/)
+  }
+  // Routing itself is untouched: the guard must not become a wall in front of the one path the Router does use.
+  expect(main({ name: 'orchestrator_route', arguments: { decisions: [] } })).toBeUndefined()
+  // A worker dispatches through its own pipeline and keeps whatever the host composed for it.
+  const { sessionId } = await acceptedTicket()
+  const worker = guards.get(sessionId)!
+  for (const name of ['subagent', 'subagent_fork', 'workflow', 'delegate', 'spawn_teammate'])
+    expect(worker({ name, arguments: { prompt: 'do the thing' } }), name).toBeUndefined()
+})
+
 it('reads the main Session\'s preset from a registry with or without presetForSession, and takes standard\'s caps when it cannot', async () => {
   const watch = { name: 'bash', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
   const route = { name: 'orchestrator_route', arguments: { decisions: [] } }
@@ -1721,8 +1978,10 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  // The router keeps only tools this profile actually provides, and only management ones: no shell, no job control.
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'read', 'read_image'] }])
+  // The router DENIES the profile's tools and the preset's own tools rather than allow-listing a fixed set: a mounted
+  // module's tools sit above the preset generation, so they stay visible without being named and without going stale when
+  // a module is swapped. This double projects no schemas, so the derived list is empty and nothing is masked.
+  expect(restricts.get(runtime.masterId)).toEqual([{ deny: [] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
@@ -1841,6 +2100,134 @@ it('creates an Executor Session under the bundle\'s worker preset, and the main 
   expect(created.find(options => options.sessionId === runtime.masterId)).toMatchObject({ agentPreset: 'dsh-superagent-router' })
 })
 
+/**
+ * `GET router-sessions` scans the whole stored-Session corpus to read the durable headers, so it must not do that per
+ * poll, and a scan that misses its deadline must not answer 500 — the client reads any failure as "the Router has no
+ * conversations" and stops hiding the duplicate row, which is the reported "the Router row is back under its Workspace".
+ */
+describe('the Router rows survive a slow or failing header scan', () => {
+  /** Swap in a persistence service whose `list` the case drives, then start a Runtime over it. */
+  const host = async (list: ReturnType<typeof vi.fn>): Promise<Runtime> => {
+    services.sessionPersistence = { list, flush: vi.fn(async () => {}),
+      open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }
+    return restart()
+  }
+  const header = (id: string, agentPreset: string) => ({ id, agentPreset, createdAt: 1, cwd: directory })
+  const routerHeader = () => [{ header: header('session-router-1', 'dsh-superagent-router') }]
+
+  it('reuses one scan across polls instead of reading the corpus every 4 s', async () => {
+    const list = vi.fn(async () => routerHeader())
+    await host(list)
+    const first = await api('GET', 'router-sessions')
+    const second = await api('GET', 'router-sessions')
+    expect(first).toMatchObject({ status: 200, body: { items: [expect.objectContaining({ sessionId: 'session-router-1' })] } })
+    expect(second.status).toBe(200)
+    expect((second.body as { items: { sessionId: string }[] }).items.map(row => row.sessionId)).toEqual(['session-router-1'])
+    // One scan for two polls: the panel polls this route, and every poll used to cost a whole-corpus read.
+    expect(list).toHaveBeenCalledTimes(1)
+  })
+
+  it('answers the last good rows when a later scan fails, instead of failing the route', async () => {
+    let healthy = true
+    const list = vi.fn(async () => {
+      if (!healthy) throw new Error('the stored Session headers did not answer in time')
+      return routerHeader()
+    })
+    await host(list)
+    expect((await api('GET', 'router-sessions')).status).toBe(200)
+    // Past the snapshot's reuse window, so this read really scans again — and this scan fails.
+    healthy = false
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(Date.now() + 2500)
+      const stale = await api('GET', 'router-sessions')
+      expect(stale.status).toBe(200)
+      expect((stale.body as { items: { sessionId: string }[] }).items.map(row => row.sessionId)).toEqual(['session-router-1'])
+    } finally { vi.useRealTimers() }
+  })
+
+  /**
+   * Three routes need the DSH session list in one poll: the group's rows, the panel's own list, and the Router chat's
+   * dispatch titles. Each used to call `sessionController.list` separately, so a busy host queued them one after another
+   * and `GET dsh-sessions` could answer 500 on its own. One shared read serves all three, and a failure answers the
+   * previous list instead of a 500.
+   */
+  it('shares one DSH session list across the routes that all need it', async () => {
+    // Self-contained: the header scan is healthy here, so `router-sessions` cannot fail for an unrelated reason.
+    await host(vi.fn(async () => routerHeader()))
+    controller.list.mockClear()
+    expect((await api('GET', 'dsh-sessions')).status).toBe(200)
+    const afterFirst = controller.list.mock.calls.length
+    expect((await api('GET', 'router-sessions')).status).toBe(200)
+    expect((await api('GET', 'router-chat?limit=5')).status).toBe(200)
+    // At most one extra read (the snapshot may have aged past its 2 s reuse window between the three calls, and this
+    // case runs on real time): what must not happen is one read per route.
+    expect(controller.list.mock.calls.length).toBeLessThanOrEqual(afterFirst + 1)
+    expect(controller.list.mock.calls.length).toBeLessThan(3)
+  })
+
+  it('answers the previous DSH session list when a later read fails, instead of answering 500', async () => {
+    controller.list.mockResolvedValue({ items: [{ sessionId: 'session-listed', updatedAt: 5, agentAvailable: true, running: false, blank: false }] })
+    expect((await api('GET', 'dsh-sessions')).status).toBe(200)
+    controller.list.mockRejectedValue(new Error('the DSH session list did not answer in time; retry once the running turn ends'))
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      // Past the reuse window, so this route really reads again — and that read fails.
+      vi.setSystemTime(Date.now() + 2500)
+      const stale = await api('GET', 'dsh-sessions')
+      expect(stale.status).toBe(200)
+      expect((stale.body as { items: { sessionId: string }[] }).items.map(row => row.sessionId)).toEqual(['session-listed'])
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('the Router conversation keeps its own Workspace', () => {
+  /**
+   * The Router talks about the deployment rather than working inside its checkout, so its conversation must not be
+   * accounted to the project's Workspace — which is where `process.cwd()` put it, and why the client had to hide its row
+   * among the project's own conversations. A Workspace accounts only for a Session whose stored `cwd` equals its `path`,
+   * so the Router gets a directory of its own and that directory is registered.
+   */
+  it('registers a Router Workspace beside the state directory and reports it as the Router home', async () => {
+    const created: string[] = []
+    // `services` is a plain record in this harness, so the previous registry is read back as one rather than spread.
+    const previous = services.workspaceRegistry as Record<string, unknown>
+    services.workspaceRegistry = {
+      ...previous,
+      list: () => [] as never[],
+      create: async (cwd: string) => {
+        created.push(cwd)
+        const entity = { id: cwd, title: cwd, sessionIds: [] as string[], detachSession: async () => {},
+          attachSession: async (sessionId: string) => { entity.sessionIds.push(sessionId) } }
+        return { id: cwd }
+      },
+    } as unknown as typeof services.workspaceRegistry
+    const fresh = await restart()
+    await fresh.ready
+    const wanted = join(directory, 'router-workspace')
+    // Registered exactly where its conversations will live, beside the state directory and outside the checkout.
+    expect(created).toContain(wanted)
+    expect(existsSync(wanted)).toBe(true)
+    // The same directory is what the route hands the client, so a row's `cwd` can be recognised as already at home.
+    expect(fresh.sessions.routerDirectory()).toBe(wanted)
+  })
+
+  it('reuses a Router Workspace the host already has instead of registering a second one', async () => {
+    const wanted = join(directory, 'router-workspace')
+    const create = vi.fn(async (cwd: string) => ({ id: cwd }))
+    services.workspaceRegistry = {
+      ...(services.workspaceRegistry as Record<string, unknown>),
+      // The registry spells a stored path its own way; only the meaning has to match, so neither case nor a trailing
+      // separator may make this look like a different directory and register the Router twice.
+      list: () => [{ id: 'existing', path: wanted.toUpperCase() + '\\' }] as never[],
+      create,
+    } as unknown as typeof services.workspaceRegistry
+    const fresh = await restart()
+    await fresh.ready
+    expect(create).not.toHaveBeenCalled()
+  })
+})
+
 it('selects its own preset again for a main Session or worker a person switched before its first turn, and not after it', async () => {
   const { sessionId } = await acceptedTicket()
   // DSH's preset registry, which takes a selection only before a Session's first turn.
@@ -1861,7 +2248,14 @@ it('selects its own preset again for a main Session or worker a person switched 
   expect(presets.select).not.toHaveBeenCalled()
   emit(sessionId, 'standard')
   await vi.waitFor(() => expect(presets.select).toHaveBeenCalledWith(agents.get(sessionId), 'dsh-superagent-worker'))
-  // Another Session is not one of dsh-superagent's.
+  // A conversation a person opened by choosing Router in the picker is corrected the same way. Live, DSH stamped the
+  // profile default over that choice, and the Session ran with read/skill/read_image only — a Router with no dispatcher.
+  const manualId = 'session-manual-router-picked'
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId: manualId, agentPreset: 'dsh-superagent-router' })
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: agents.get(manualId)! } as never)
+  presets.select.mockClear()
+  emit(manualId, 'standard')
+  await vi.waitFor(() => expect(presets.select).toHaveBeenCalledWith(agents.get(manualId), 'dsh-superagent-router'))  // Another Session is not one of dsh-superagent's.
   presets.select.mockClear()
   emit('someone-else', 'standard'); emit('worker-nothing', 'standard'); await Promise.resolve()
   expect(presets.select).not.toHaveBeenCalled()
@@ -1870,6 +2264,26 @@ it('selects its own preset again for a main Session or worker a person switched 
   emit(runtime.masterId, 'standard')
   await vi.waitFor(() => expect(presets.select).toHaveBeenCalledTimes(1))
   await expect(presets.select.mock.results[0]!.value).rejects.toMatchObject({ code: 'agent-preset/locked' })
+})
+
+it('drops the Router surface when the same Session is re-composed under another preset', async () => {
+  // DSH re-composes a Session in place, reusing its `agent.ctx`. A binding left from the Router composition would keep its
+  // restricted allow-list and its delegation guards on a Session that is no longer a Router — a standard conversation that
+  // cannot run its own shell. The composition follows the preset each time.
+  const sessionId = 'session-switch-away'
+  // The handler reaches `child.get('agentPresets')` only when it has to ask for a re-selection; this test is about the
+  // composition, so the registry only needs to exist and answer the selection itself.
+  services.agentPresets = { select: vi.fn(async (_agent: unknown, preset: string) => preset) }
+  await (await restart()).ready
+  await (controller.create as (request: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId, agentPreset: 'dsh-superagent-router' })
+  const agent = agents.get(sessionId)!
+  const emit = (preset: string) => (runtime as unknown as { ctx: Context }).ctx.emit('agent-preset/selected', sessionId, preset)
+  emit('dsh-superagent-router')
+  await vi.waitFor(() => expect(guards.get(sessionId)).toBeTypeOf('function'))
+  expect(guards.get(sessionId)!({ name: 'subagent', arguments: {} })).toMatch(/^This Router dispatches work/)
+  // The person switches it to the ordinary preset: the Router guards and allow-list must not survive that.
+  emit('standard')
+  await vi.waitFor(() => expect(guards.get(sessionId)).toBeUndefined())
 })
 
 it('gives a subagent of a worker only the worker\'s work tools, and none once the ticket ended', async () => {

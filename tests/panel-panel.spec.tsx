@@ -3,7 +3,7 @@
 import { act } from 'react'
 import { expect, it } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, settle, all, click, type, text, field } from './fixtures/panel.tsx'
+import { usePanel, mount, remount, settle, all, click, type, text, field, tab } from './fixtures/panel.tsx'
 import { server, found } from './fixtures/panel-server.ts'
 
 usePanel()
@@ -38,6 +38,8 @@ it('explains what can be searched when nothing matches', async () => {
 
 it('returns to the exact page after a remount of the main panel', async () => {
   await mount()
+  // The panel opens on Router now, so a Ticket is reached through the Execution tab rather than the first screen.
+  await click(tab(zh['tab.execution']))
   await click('修复回归')
   await remount()
   expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('修复回归')
@@ -45,7 +47,8 @@ it('returns to the exact page after a remount of the main panel', async () => {
 
 it('shows domain terms in the interface language only and lists both languages in the (?) glossary', async () => {
   await mount(en)
-  expect(all('[role="tab"]').map(tab => tab.textContent)).toEqual(['Overview', 'Source', 'Trigger', 'Eval', 'Execution', 'Settings'])
+  // The Router tab is its own page (the panel opens there), so it sits between Overview and Source.
+  expect(all('[role="tab"]').map(tab => tab.textContent)).toEqual(['Overview', 'Router', 'Source', 'Trigger', 'Eval', 'Execution', 'Settings'])
   await click('Glossary')
   const dialog = document.querySelector('[role="dialog"]')!
   const row = [...dialog.querySelectorAll('tr')].find(item => item.textContent?.startsWith('Ticket'))!

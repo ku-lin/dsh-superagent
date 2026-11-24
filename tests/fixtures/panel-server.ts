@@ -97,6 +97,8 @@ export interface PanelServer {
   pluginResults: ApiResponse<'GET plugin-search'>
   routerChat: ApiResponse<'GET router-chat'>
   routerSessions: ApiResponse<'GET router-sessions'>
+  /** Historical subagent-origin conversations the cleanup list offers, as `GET delegated-sessions` answers it. */
+  delegatedSessions: ApiResponse<'GET delegated-sessions'>['items']
   /** The Router panel's task list, as `GET tasks` answers it; the rail polls this. */
   tasks: ApiResponse<'GET tasks'>
   /** The failure log the panel lists and the report route appends to, oldest first. */
@@ -277,6 +279,7 @@ function initial(): PanelServer {
     pluginResults: { entries: [], total: 0, nextOffset: null },
     routerChat: { sessionId: 'master', items: [] as { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] },
     routerSessions: { masterId: 'master', items: [] },
+    delegatedSessions: [],
     tasks: { available: true, detail: '', at: '2026-09-23T00:00:00Z', projects: [
       { id: 'project-1', key: 'FIXTURE', name: 'Fixture project', tasks: [
         { identifier: 'FIXTURE-2', title: '还没开始的那件', status: 'todo', priority: 'medium', updatedAt: '2026-09-22T00:00:00Z' },
@@ -411,6 +414,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
       detached: [], projections: 'absent', log: { state: 'removed', path: '/sessions/' + params.id } }
     return report
   } },
+  'GET delegated-sessions': { answer: () => page(server.delegatedSessions) },
   'GET plugin-indexes': { answer: () => server.pluginIndexes },
   'GET plugin-search': { query: ['url', 'text'], answer: () => server.pluginResults },
   'POST tickets/:id/worker-session': { body: true, answer: ({ params, body }) => {

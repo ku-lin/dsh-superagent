@@ -9,6 +9,64 @@ of the compatibility surface: a change that raises it is a breaking change. The
 `1.x` line is the first published line; the upstream prototype it is based on called
 itself `0.1.0`, which is why this repository starts at `1.0.0` instead.
 
+## [Unreleased]
+
+The Router stops being a special sidebar group and becomes an ordinary conversation that lives in its own Workspace,
+and it can be replaced without losing what it knew: the old conversation's text is archived before the replacement
+takes over. A worker or a conversation that stops is reported to the Router by a fixed code path.
+
+### Added
+
+- **A Workspace of the Router's own.** Router conversations are created with `cwd` set to a directory this plugin owns
+  (`routerDirectory()`, `$DSH_HOME/state/superagent/router-workspace`), registered as its own Workspace, so the sidebar
+  lists them natively and the Router is accounted to nothing else. `selectRouterSessions` now reports `atHome`, which
+  says whether a row already lives there; a Router created before that directory existed keeps its old `cwd`, still
+  lists, and is the only case where a duplicate native row is hidden.
+- **The Router's door in the sidebar foot.** One `sidebar.footer.action` button (`src/client/router-footer.tsx`) opens
+  the permanent conversation from anywhere. Its id comes from the host's own list, so a replaced Router never leaves it
+  pointing at a dead Session; with no conversation to open it falls back to the management panel. It only navigates.
+- **Stable Router identities over refreshable generations** (`src/app/router-registry.ts`). One preparation at a time,
+  `commit` archives the complete source Session before it moves the pointer, and `read`/`operate` refuse an inactive
+  generation or a pending refresh, so a Session replaced by a refresh cannot keep operating its project. The gate is
+  rechecked at execution time, which is what takes the tools away from the superseded Session the moment a refresh
+  commits.
+- **Archive before refresh** (`src/app/router-refresh.ts`, `src/app/router-session-host.ts`). Hold the Session's
+  admission, export its complete flushed log, summarise deterministically, create and verify the replacement, then
+  commit once; a failure at any step aborts the preparation and leaves the old Session, its history and its pointer in
+  place. The four management routes answer it, and `scripts/accept-router-refresh.mjs` drives them against a live host.
+- **Project knowledge** (`src/app/project-knowledge.ts`). The project's original conversation text is archived
+  byte-exact by `(project, Session, source range)` with a SHA-256 and idempotent re-import, kept apart from the editable
+  latest-state summary with its CAS revision. `read` mints a single-use receipt naming the Router, project and revision;
+  `operate` consumes it in the same transaction as the caller's durable write and refuses a stale revision, a forged
+  Router or a changed binding.
+- **A silent patrol** (`src/core/patrol.ts`, `src/app/patrol.ts`). `findings` derives what is worth telling the Router
+  from facts the Store already holds — a worker gone quiet, an Assignment running too long, a question only a person can
+  answer, an Input that could not be handed over, a `reply` the queue gave up on. Only additions wake anyone, and a key
+  already reported never re-announces itself; the host arms one timer for `nextDue` instead of polling, and the baseline
+  moves only after the notice left the queue, so a failed notice is re-sent rather than recorded as delivered.
+- **`planRelief`** (`src/app/context-relief.ts`): a model-free oldest-span cut for a conversation whose summariser is
+  unavailable. Not installed by `src/index.ts` — reducing Router context without archiving it loses decisions, so that
+  path goes through `router-refresh.ts` instead.
+- **`scripts/` for the acceptance work**: refresh/concurrency/durability against a live host, the real-archive replay,
+  the router guard and tool surface read from the host, `session-header`/`session-progress`/`session-roundtrip`, the
+  delegated-Session inventory and the preset-label check. `docs/009-router-acceptance.md` records what each one proved
+  on this machine and which conclusions came from a test rather than a host.
+
+### Changed
+
+- **The Router admits the tools a mounted module contributes.** The tool set a Router Session runs with is the
+  profile's own plus what the mounted layer registers, nothing when nothing is mounted, stable when recomputed under its
+  own restriction, and dropped again once the layer unmounts.
+- **`sessions.ts` creates a Router the same way it creates any other conversation**: with a Workspace and the router
+  preset, named before its first message, and verified blank before a refresh stages it.
+
+### Removed
+
+- **The virtual Router workspace** (`src/client/router-workspace.ts` and its stylesheet rules). One group injected into
+  `sidebar.workspaces`, plus a `style[data-plugin-css]` rule that hid the native row of any conversation the group also
+  drew, is replaced by the native listing and the foot button above. The Router page loses its duplicate-row switch and
+  its locator, because there is no longer a second list to disagree with.
+
 ## [1.2.7] - 2026-11-21
 
 The Router's right-hand side now carries the Taskboard's task list, and it is kept current by a push channel instead of

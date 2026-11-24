@@ -10,102 +10,129 @@
  *
  * Two subtleties lifted from upstream, both about not crying wolf:
  *
- * - **Only additions count.** If findings merely disappear (a question got answered, a failed
- *   delivery cleared), that is not news; the Router does not need waking to be told that something
+ * - **Only additions count.** If findings merely disappear (a question got answered, a failed delivery
+ *   went through), that is not news; the Router does not need waking to be told that something
  *   stopped. So `gone` entries are reported alongside additions but cannot trigger a wake on their own.
- * - **A key that already fired stays quiet.** A stuck job that was reported once keeps being reported
- *   in the text while it stays stuck, but does not re-announce itself just because memory free space
- *   wobbled across the threshold between two ticks.
+ * - **A key that already fired stays quiet.** A stuck worker that was reported once keeps being
+ *   reported in the text while it stays stuck, but does not re-announce itself just because its
+ *   minutes-since counter moved between two ticks.
  *
  * What this is not: it does not judge the work. It cannot tell whether a worker is making progress or
- * just running long — it only knows how long it has been since the last report and how long the
- * current turn has been open. That is why every finding is phrased as an observation with a number in
+ * just running long — it only knows how long it has been since the last report and how long its
+ * assignment has been open. That is why every finding is phrased as an observation with a number in
  * it, not as a verdict.
+ *
+ * Every field of {@link PatrolInput} is a fact this system actually stores: an open Ticket's latest
+ * Assignment, its `attention` question, its failed Input `delivery`, and the `reply` effect rows that
+ * failed past the error threshold. A snapshot of memory pressure or of a queue this plugin never
+ * measures is deliberately absent — an invented number would be reported with the same confidence as a
+ * measured one, and a Router cannot tell the difference.
  */
 import { createHash } from 'node:crypto'
 
 /** One thing worth telling the Router, identified by a key that stays the same across ticks. */
 export interface Finding {
-  /** Stable across ticks: same problem, same key. This is what makes silence possible. */
+  /** Stable across ticks for the same problem at the same place. This is what makes silence possible. */
   readonly key: string
   readonly text: string
 }
 
-/** A worker that has not reported for longer than this is stalled, not just busy. */
+/** Thresholds at which an observation becomes worth mentioning. All are durations in milliseconds. */
 export interface PatrolOptions {
-  /** How long without a report before it counts as stalled. */
+  /** How long a worker expected to report may go quiet before it counts as stalled. */
   readonly stallMs: number
-  /** How long a single open turn may run before it is worth mentioning. */
+  /** How long one Assignment may stay running before it is worth mentioning. */
   readonly longRunMs: number
-  /** How long something may wait on a person before it is worth mentioning. */
+  /** How long a question may wait on a person before it is worth mentioning. */
   readonly waitMs?: number
-  /** How long a queued heavy job may wait before it is worth mentioning. */
-  readonly heavyStuckMs?: number
+}
+
+/** An open Assignment's worker, as its Ticket and that Assignment describe it. */
+export interface WorkerSnapshot {
+  /** The DSH Session the Assignment runs in. */
+  readonly session: string
+  /** The Ticket's id, which is what an operator acts on. */
+  readonly task: string
+  /** The Ticket's title, so the line reads without a lookup. */
+  readonly title: string
+  /**
+   * What the worker last said of itself: a `ReportState`, `awaiting-report` before its first report, or
+   * `reported` when its latest report is a state that legitimately waits instead of reporting.
+   */
+  readonly state: string
+  /** Epoch ms of the latest report, the Assignment's start, or the Ticket's own timestamp, whichever applies. */
+  readonly lastReportMs: number
+  /** Epoch ms when the current Assignment started, or 0 when it is not running. */
+  readonly runningSinceMs: number
+  /**
+   * Whether silence is suspicious. A worker that reported `waiting`, `ready`, `blocked` or `failed` is
+   * waiting on something else on purpose; calling that a stall would report the same situation twice,
+   * as a stall *and* as the question it is actually waiting on.
+   */
+  readonly expectsReports: boolean
+}
+
+/** A question only a person can answer: a Ticket's `attention`. */
+export interface WaitingSnapshot {
+  readonly ticket: string
+  /** The `attention` id, which changes when the question does, so an answered one is not re-announced. */
+  readonly id: string
+  readonly question: string
+  /** Epoch ms the question was raised, from the report that carried it. */
+  readonly since: number
+}
+
+/** An Input that could not be handed to its worker; the Ticket's `delivery` keeps the last one. */
+export interface DeliverySnapshot {
+  readonly ticket: string
+  readonly error: string
+  /** Epoch ms of the failed delivery. */
+  readonly at: number
+}
+
+/** A message whose `reply` effect failed repeatedly and is still queued. */
+export interface ReplySnapshot {
+  /** The receipt's id, which the outbox and its effect row are keyed by. */
+  readonly key: string
+  /** Where it was going, as the Channel's thread. */
+  readonly to: string
+  readonly error: string
+  readonly attempts: number
 }
 
 /** What the patrol reads. Deliberately a plain snapshot: the patrol performs no I/O of its own. */
 export interface PatrolInput {
-  /** Workers that are currently active, with their latest activity in epoch ms. */
-  readonly workers: ReadonlyArray<{
-    readonly session: string
-    readonly task: string
-    readonly state: string
-    /** Epoch ms of the last report, or of the last update when none arrived. */
-    readonly lastReportMs: number
-    /** Epoch ms when the current turn opened, or 0 when idle. */
-    readonly turnStartedMs: number
-    readonly running: boolean
-  }>
-  /** Items blocked on a human: approvals and open questions. */
-  readonly waiting?: ReadonlyArray<{
-    readonly session: string
-    readonly kind: 'approval' | 'question'
-    readonly label: string
-    readonly since: number
-  }>
-  /** Deliveries that gave up retrying. */
-  readonly failedDeliveries?: ReadonlyArray<{
-    readonly key: string
-    readonly from: string
-    readonly to: string
-    readonly error: string
-  }>
-  /** Open questions waiting on a person, one finding each. */
-  readonly openQuestions?: ReadonlyArray<{
-    readonly id: string
-    readonly task: string
-    readonly question: string
-  }>
-  /** Heavy jobs that are queued, with the free memory the queue sees. */
-  readonly heavy?: {
-    readonly freeGb: number
-    readonly jobs: ReadonlyArray<{
-      readonly id: string
-      readonly label: string
-      readonly session: string
-      readonly minFreeGb: number
-      readonly queuedAt: number
-    }>
-  }
+  readonly workers: ReadonlyArray<WorkerSnapshot>
+  readonly waiting?: ReadonlyArray<WaitingSnapshot>
+  readonly failedDeliveries?: ReadonlyArray<DeliverySnapshot>
+  readonly stuckReplies?: ReadonlyArray<ReplySnapshot>
 }
+
+/** Longest a quoted field may be, so one long error cannot swamp the message. */
+const QUOTE = 140
+const clip = (text: string): string => text.length > QUOTE ? `${text.slice(0, QUOTE)}…` : text
+const minutes = (ms: number): number => Math.max(0, Math.round(ms / 60_000))
 
 /** The full set of findings for one moment. Pure: same input, same output. */
 export function findings(input: PatrolInput, options: PatrolOptions, now: number): Finding[] {
   const out: Finding[] = []
-  const minutes = (ms: number) => Math.round(ms / 60_000)
 
   for (const worker of input.workers) {
-    const last = Math.max(worker.lastReportMs, 0)
-    if (now - last > options.stallMs) {
+    const quiet = now - worker.lastReportMs
+    if (worker.expectsReports && quiet > options.stallMs) {
       out.push({
-        key: `stalled:${worker.session}:${worker.task}`,
-        text: `${worker.session} on ${worker.task} [${worker.state}] has not reported for ${minutes(now - last)} min`,
+        // The Ticket, not the Assignment: a worker that recovers and stalls again is the same problem in
+        // the same place, and a new Assignment id would re-announce it as fresh news.
+        key: `stalled:${worker.task}`,
+        text: `${worker.title} (${worker.task}, ${worker.session}) has not reported for ${minutes(quiet)} min; its last word was ${worker.state}`,
       })
     }
-    if (worker.running && worker.turnStartedMs && now - worker.turnStartedMs > options.longRunMs) {
+    if (worker.runningSinceMs > 0 && now - worker.runningSinceMs > options.longRunMs) {
       out.push({
-        key: `long-run:${worker.session}:${worker.turnStartedMs}`,
-        text: `${worker.session} has been in one turn for ${minutes(now - worker.turnStartedMs)} min`,
+        // The start time stays in the key: a relaunched Assignment is a different run, and a Router that
+        // was told about the first one should hear about the second.
+        key: `long-run:${worker.task}:${worker.runningSinceMs}`,
+        text: `${worker.title} (${worker.task}) has been running one assignment for ${minutes(now - worker.runningSinceMs)} min`,
       })
     }
   }
@@ -113,51 +140,55 @@ export function findings(input: PatrolInput, options: PatrolOptions, now: number
   const waitMs = options.waitMs ?? 10 * 60_000
   for (const item of input.waiting ?? []) {
     if (now - item.since <= waitMs) continue
-    const what = item.kind === 'approval' ? 'approval' : 'an answer'
     out.push({
-      key: `waiting:${item.session}:${item.since}`,
-      text: `${item.session} has been waiting ${minutes(now - item.since)} min for ${what}: ${item.label} (only a person can clear it)`,
+      // The attention id, so answering this question and the worker asking another are two events rather
+      // than one key that changes underneath the Router.
+      key: `ask:${item.ticket}:${item.id}`,
+      text: `${item.ticket} has waited ${minutes(now - item.since)} min for an answer only a person can give: ${clip(item.question)}`,
     })
   }
 
   for (const failed of input.failedDeliveries ?? []) {
     out.push({
-      key: `delivery-failed:${failed.key}`,
-      text: `a message gave up retrying: ${failed.from} → ${failed.to}, ${failed.key}: ${failed.error}`,
+      // Keyed by the Ticket: a retried delivery that keeps failing is one problem, and its newest error is
+      // not news. A delivery that succeeds drops the entry, so a later failure is an addition again.
+      key: `delivery-failed:${failed.ticket}`,
+      text: `an input for ${failed.ticket} could not be handed to its worker ${minutes(now - failed.at)} min ago: ${clip(failed.error)}`,
     })
   }
 
-  // One finding per question. Concatenating the ids into one key was a real upstream defect: answering
-  // any single question changed the key, so the remaining ones looked like fresh news.
-  for (const question of input.openQuestions ?? []) {
+  for (const reply of input.stuckReplies ?? []) {
     out.push({
-      key: `ask:${question.id}`,
-      text: `waiting on a person: ${question.question.slice(0, 60)} (${question.task})`,
+      key: `reply-stuck:${reply.key}`,
+      text: `a message to ${reply.to} has failed ${reply.attempts} times and is still queued: ${clip(reply.error)}`,
     })
-  }
-
-  const stuckMs = options.heavyStuckMs ?? 15 * 60_000
-  if (input.heavy) {
-    const queued = input.heavy.jobs
-    for (const job of queued) {
-      const waited = now - job.queuedAt
-      // Stuck means *both* waited too long and cannot run: a job that is merely waiting its turn behind
-      // a bigger one is the queue working, not a problem. Reporting it would make every long queue look
-      // stuck and train the reader to ignore this line.
-      const stuck = waited > stuckMs && job.minFreeGb > input.heavy.freeGb
-      if (!stuck) continue
-      const behind = queued.filter(other => other.id > job.id).length
-      out.push({
-        key: `heavy-stuck:${job.id}`,
-        text:
-          `heavy job ${job.id}「${job.label}」(${job.session}) queued ${minutes(waited)} min and cannot start: ` +
-          `needs ${job.minFreeGb} GB free, ${input.heavy.freeGb.toFixed(1)} GB available` +
-          `${behind ? `, ${behind} more behind it` : ''}`,
-      })
-    }
   }
 
   return out
+}
+
+/**
+ * The earliest instant, strictly after `now`, at which a condition that is quiet right now becomes a
+ * finding. Pure, so the host can arm exactly one timer instead of ticking every few seconds.
+ *
+ * Conditions already true (a failed delivery, a stuck reply) contribute nothing: they are findings the
+ * moment they exist, so a caller that has just ticked has already reported them. If they are gone, only
+ * an external change can bring them back — which is what `request()` is for.
+ *
+ * @returns epoch ms of the next crossing, or `undefined` when nothing is waiting to cross a threshold.
+ */
+export function nextDue(input: PatrolInput, options: PatrolOptions, now: number): number | undefined {
+  const candidates: number[] = []
+  // One millisecond past the threshold: `findings` uses a strict `>`, so a timer armed exactly on the
+  // boundary would re-arm itself for the same instant and spin.
+  const consider = (when: number): void => { if (when >= now) candidates.push(when + 1) }
+  for (const worker of input.workers) {
+    if (worker.expectsReports) consider(worker.lastReportMs + options.stallMs)
+    if (worker.runningSinceMs > 0) consider(worker.runningSinceMs + options.longRunMs)
+  }
+  const waitMs = options.waitMs ?? 10 * 60_000
+  for (const item of input.waiting ?? []) consider(item.since + waitMs)
+  return candidates.length ? Math.min(...candidates) : undefined
 }
 
 /** A hash of the sorted keys: equal signatures mean "the same set of problems". */
@@ -173,6 +204,12 @@ export interface TickResult {
   readonly text?: string
   readonly added: readonly Finding[]
   readonly gone: readonly string[]
+  /**
+   * The whole set at this moment, added and kept alike. The caller stores `reportedMap(current)` after a
+   * tick that spoke; recomputing the map from `added` alone drops the findings that are still present,
+   * and the next tick announces them as new.
+   */
+  readonly current: readonly Finding[]
 }
 
 /**
@@ -183,7 +220,8 @@ export interface TickResult {
  *
  * **Every outcome carries the new signature and the caller must store it**, including `quiet`. A tick
  * that stays silent because nothing was added still has a different signature when something was
- * removed; not storing it makes the next tick report the same removals forever.
+ * removed; not storing it makes the next tick report the same removals forever — and keeps a problem
+ * that disappeared inside the map, so its return would be silent.
  */
 export function tick(
   input: PatrolInput,
@@ -195,7 +233,7 @@ export function tick(
   const signature = signatureOf(current)
 
   if (signature === previous.signature) {
-    return { kind: 'quiet', signature, added: [], gone: [] }
+    return { kind: 'quiet', signature, added: [], gone: [], current }
   }
 
   const seen = previous.reported ?? {}
@@ -207,25 +245,25 @@ export function tick(
   if (!current.length) {
     // Everything cleared. Worth recording as its own outcome so a caller can log it, but never worth
     // waking anyone: "nothing is wrong" is not news.
-    return { kind: 'cleared', signature, added: [], gone }
+    return { kind: 'cleared', signature, added: [], gone, current }
   }
 
   if (!added.length) {
     // Only losses. Upstream calls this `gone-only` and stays silent; so do we. The new signature is
     // still returned so the caller stops re-reporting the entries that disappeared.
-    return { kind: 'quiet', signature, added: [], gone }
+    return { kind: 'quiet', signature, added: [], gone, current }
   }
 
   const kept = current.filter(item => item.key in seen)
   const lines = [
-    `patrol found ${current.length} item(s) (sent because the set changed; ask for the full list to see all):`,
+    `patrol found ${current.length} item(s):`,
     `new ${added.length}:`,
     ...added.map(item => `- ${item.text}`),
     ...(gone.length ? [`cleared, no action needed: ${gone.join('; ')}`] : []),
     ...(kept.length ? [`already reported, still present ${kept.length}:`, ...kept.map(item => `- ${item.text}`)] : []),
   ]
 
-  return { kind: 'reported', signature, text: lines.join('\n'), added, gone }
+  return { kind: 'reported', signature, text: lines.join('\n'), added, gone, current }
 }
 
 /** The map to store back after a tick, so the next one can tell additions from repeats. */

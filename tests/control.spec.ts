@@ -39,7 +39,8 @@ function state(): { directory: string; store: Store } {
  * A host the control surface can drive: real headers for the conversations it knows, one workspace that accounts for them,
  * and a projection cache whose row a deletion drops.
  */
-function host(store: Store, headers: readonly { id: string; agentPreset?: string }[], options: { root?: string | undefined } = {}) {
+function host(store: Store, headers: readonly { id: string; agentPreset?: string; origin?: string; parentSession?: string }[],
+  options: { root?: string | undefined; masterId?: string; routers?: { protectsSession(id: string): boolean } } = {}) {
   const archived: string[] = [], detached: string[] = [], dropped: string[] = []
   const workspaces = headers.map(item => ({ id: `ws-${item.id}`, title: `Workspace ${item.id}`,
     sessionIds: [item.id as never] as never, detachSession: async (id: string) => { detached.push(id) } }))
@@ -48,14 +49,16 @@ function host(store: Store, headers: readonly { id: string; agentPreset?: string
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
     agents: { get: () => undefined },
     sessionPersistence: { list: async () => headers.map(item => ({ header: { version: SESSION_FORMAT_VERSION, id: item.id,
-      createdAt: 1_000, isSeeded: false, ...item.agentPreset ? { agentPreset: item.agentPreset } : {} } })) },
+      createdAt: 1_000, isSeeded: false, ...item.agentPreset ? { agentPreset: item.agentPreset } : {},
+      ...item.origin ? { origin: item.origin } : {}, ...item.parentSession ? { parentSession: item.parentSession } : {} } })) },
     workspaceRegistry: { archiveSession: async (id: string) => { archived.push(id) }, list: () => workspaces },
     get: (name: string) => name === 'storageDomain' ? { get: () => ({ table: () => ({
       get: (key: string) => rows.get(key) ? { ver: 1 } : undefined,
       delete: async (key: string) => { dropped.push(key); return true } }) }) } : undefined,
   }
-  const control = new Control({ context: context as unknown as Context, store, masterId: MASTER, requestPass: () => {},
-    sessionRoot: () => options.root })
+  const control = new Control({ context: context as unknown as Context, store, masterId: () => options.masterId ?? MASTER,
+    ownsWorker: id => headers.some(header => header.id === id && header.agentPreset === WORKER_PRESET),
+    requestPass: () => {}, sessionRoot: () => options.root, ...options.routers === undefined ? {} : { routers: options.routers } })
   return { control, archived, detached, dropped }
 }
 
@@ -136,6 +139,55 @@ describe('deleting a conversation', () => {
     const { control } = host(store, [{ id: 'session-other', agentPreset: ROUTER_PRESET }])
     expect(await control.sessionKind('session-other')).toBe('router')
     expect(await control.deleteSession('session-other', true, 'tool')).toMatchObject({ kind: 'router', archived: true })
+  })
+
+  it('lets an archived main Router be deleted once a refresh replaced it, and keeps a live or unarchived one', async () => {
+    const { store } = state()
+    // MASTER is now generation 1 only in history: the live main Router is a newer Session, and the archive holds MASTER's
+    // text. This is exactly the state a committed archive-before-refresh leaves behind.
+    const live = 'session-live'
+    const control = host(store, [{ id: MASTER, agentPreset: ROUTER_PRESET }, { id: live, agentPreset: ROUTER_PRESET }],
+      { masterId: live, routers: { protectsSession: id => id !== MASTER } }).control
+    expect(await control.sessionKind(live)).toBe('router-main')
+    expect(await control.sessionKind(MASTER)).toBe('router')
+    expect(await control.deleteSession(MASTER, true, 'panel')).toMatchObject({ kind: 'router', archived: true })
+
+    // Without an archive to fall back on, a replaced conversation stays protected: deleting it would lose its text.
+    const unarchived = host(store, [{ id: MASTER, agentPreset: ROUTER_PRESET }, { id: live, agentPreset: ROUTER_PRESET }],
+      { masterId: live, routers: { protectsSession: () => true } }).control
+    await expect(unarchived.deleteSession(MASTER, true, 'panel')).rejects.toMatchObject({ code: 'routerSession', status: 409 })
+  })
+
+  it('refuses foreign subagents, forged worker prefixes, and cyclic ancestry without side effects', async () => {
+    const { store } = state()
+    const { control, archived } = host(store, [
+      { id: MASTER, agentPreset: ROUTER_PRESET },
+      { id: 'session-person', agentPreset: 'standard' },
+      { id: 'worker-forged', agentPreset: 'standard' },
+      { id: 'foreign-child', origin: 'subagent', parentSession: 'session-person' },
+      { id: 'orphan', origin: 'subagent' },
+      { id: 'cycle-a', origin: 'subagent', parentSession: 'cycle-b' },
+      { id: 'cycle-b', origin: 'subagent', parentSession: 'cycle-a' },
+    ])
+    for (const id of ['session-person', 'worker-forged', 'foreign-child', 'orphan', 'cycle-a', 'cycle-b']) {
+      expect(await control.sessionKind(id)).toBeUndefined()
+      await expect(control.deleteSession(id, true, 'panel')).rejects.toMatchObject({ code: 'notDeletable' })
+    }
+    expect(archived).toEqual([])
+  })
+
+  it('deletes a conversation a Router spawned as its subagent, which the cleanup list offers', async () => {
+    const { store } = state()
+    // A subagent runs `standard`, not the router preset, so the preset test alone classified it as "not ours" and the
+    // delete route refused every row `GET delegated-sessions` listed — the cleanup surface would have been a dead end.
+    const child = '4d2a6c1f-1f59-439f-a28a-7c8dee312b77'
+    const control = host(store, [{ id: MASTER, agentPreset: ROUTER_PRESET },
+      { id: child, agentPreset: 'standard', origin: 'subagent', parentSession: MASTER }], { masterId: MASTER }).control
+    expect(await control.sessionKind(child)).toBe('delegated')
+    expect(await control.deleteSession(child, true, 'panel')).toMatchObject({ kind: 'delegated', archived: true })
+    // An ordinary conversation of the person's own is still refused: this classification is for spawned children only.
+    const mine = host(store, [{ id: 'session-mine', agentPreset: 'standard' }], { masterId: MASTER }).control
+    await expect(mine.deleteSession('session-mine', true, 'panel')).rejects.toMatchObject({ code: 'notDeletable' })
   })
 })
 

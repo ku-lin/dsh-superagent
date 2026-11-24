@@ -5,7 +5,9 @@ import { Runtime } from './app/runtime.ts'
 import { Config, machineOf, type DeploymentConfig } from './deployment.ts'
 
 export const name = 'dsh-superagent'
-export const inject = ['agents', 'sessionController', 'sessionPersistence', 'workspaceRegistry', 'permissionPresets', 'tools', 'systemPrompt', 'skills', 'webServer', 'llm', 'subprocess']
+// `sessions` is injected because the Router refresh flushes one Session's log before archiving it; without the
+// declaration the service is not reachable on `ctx` and the flush throws "cannot get property without inject".
+export const inject = ['agents', 'sessions', 'sessionController', 'sessionPersistence', 'workspaceRegistry', 'permissionPresets', 'tools', 'systemPrompt', 'skills', 'webServer', 'llm', 'subprocess']
 export { Config }
 export async function apply(ctx: Context, config: DeploymentConfig): Promise<void> {
   const machine = machineOf(config)
@@ -20,6 +22,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   }
   const runtime = new Runtime(ctx, machine, restart)
   ctx.effect(() => async () => { await runtime.stop() })
+  // app/context-relief.ts is intentionally NOT installed: it drops the oldest span without archiving it, which loses
+  // decisions permanently and violates the Router contract that archiving must succeed before context is replaced.
+  // Router context reduction goes through app/router-refresh.ts instead; a future deterministic relief must archive
+  // the dropped span into the project knowledge base first.
   await runtime.ready
   // A state directory another process holds keeps the plugin mounted and its routes answering; the panel reports the wait.
   ctx.logger.info(runtime.lockWait ? 'dsh-superagent is waiting for the state directory lock of another process; the panel reports the wait'

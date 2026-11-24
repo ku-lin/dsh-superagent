@@ -24,11 +24,16 @@ export {
 // Patrol: a set of findings keyed by a stable id, so an unchanged set costs nothing.
 export {
   findings,
+  nextDue,
   reportedMap,
   signatureOf,
   tick,
+  type DeliverySnapshot,
   type Finding,
   type PatrolInput,
   type PatrolOptions,
+  type ReplySnapshot,
   type TickResult,
+  type WaitingSnapshot,
+  type WorkerSnapshot,
 } from './patrol.ts'

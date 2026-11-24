@@ -39,16 +39,22 @@ it('does not navigate after the panel unmounts or a newer request supersedes it'
   controller.abort(); state.phase = 'ready'; state.byId[id] = {}; pending.resolve()
   await expect(navigation).resolves.toBe(false); expect(open).not.toHaveBeenCalled()
 })
-it('reopens the page this tab showed last, and the overview for a route that no longer exists', () => {
+it('reopens the page this tab showed last, and the home page for a route that no longer exists', () => {
   remember({ route: { page: 'eval', query: { filter: 'stop' } }, stack: [{ page: 'overview' }] })
   expect(initialLocation()).toEqual({ route: { page: 'eval', query: { filter: 'stop' } }, stack: [{ page: 'overview' }] })
-  // The Eval tab was previously named Policy; a route saved under the old name falls back to overview.
-  sessionStorage.setItem('dsh-superagent/route', JSON.stringify({ route: { page: 'policy' }, stack: [] }))
-  expect(initialLocation()).toEqual({ route: { page: 'overview' }, stack: [] })
-  sessionStorage.setItem('dsh-superagent/route', JSON.stringify({ route: { page: 'trigger', id: 'github:1' }, stack: [{ page: 'policy' }, { page: 'trigger' }] }))
+  // The Eval tab was previously named Policy, and the home page has moved from Overview to Router: a route saved under
+  // the old name is not a route this build knows, so the tab opens on the home page. The key is v2 for that reason.
+  const key = 'dsh-superagent/route.v2'
+  sessionStorage.setItem(key, JSON.stringify({ route: { page: 'policy' }, stack: [] }))
+  expect(initialLocation()).toEqual({ route: { page: 'worker' }, stack: [] })
+  sessionStorage.setItem(key, JSON.stringify({ route: { page: 'trigger', id: 'github:1' }, stack: [{ page: 'policy' }, { page: 'trigger' }] }))
   expect(initialLocation().stack).toEqual([{ page: 'trigger' }])
-  sessionStorage.setItem('dsh-superagent/route', '{')
-  expect(initialLocation().route).toEqual({ page: 'overview' })
+  // A key this build no longer writes is ignored outright, so an older tab cannot resurrect a removed page either.
+  sessionStorage.clear()
+  sessionStorage.setItem('dsh-superagent/route', JSON.stringify({ route: { page: 'eval' }, stack: [] }))
+  expect(initialLocation().route).toEqual({ page: 'worker' })
+  sessionStorage.setItem(key, '{')
+  expect(initialLocation().route).toEqual({ page: 'worker' })
 })
 it('reads each page a tab remembered with the parameters it takes, and leaves out what it does not know', () => {
   expect(parseRoute({ page: 'trigger', query: { filter: 'nope', trigger: 'e1' } })).toEqual({ page: 'trigger' })

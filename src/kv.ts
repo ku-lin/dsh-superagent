@@ -8,6 +8,7 @@ import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 import type { AuditEntry, RouterSwitch } from './app/control.ts'
 import type { FailureRecord } from './app/failures.ts'
+import type { PatrolState } from './app/patrol.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -32,12 +33,14 @@ export const KV = {
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID, the main Session that already got its opening message, the Router switch, the
-   * audit trail of the panel's own write operations, and the bounded log of failures a fixed code path recorded. */
+   * audit trail of the panel's own write operations, the bounded log of failures a fixed code path recorded, and the
+   * patrol's baseline (the finding set the Router was last told about). */
   runtime: { masterId: record<string>('master-id'), greeted: record<string>('master-greeted'),
     router: record<RouterSwitch>('router-switch'), audit: record<AuditEntry[]>('audit'),
-    failures: record<FailureRecord[]>('failures') },
+    failures: record<FailureRecord[]>('failures'), patrol: record<PatrolState>('patrol') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
-  sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
+  sessions: { prompts: family<number[], [session: string]>('session-prompts:'),
+    directWorker: family<{ signature: string; requestedId: string; workspaceId: string; sessionId?: string; delivered?: true }>('direct-worker:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

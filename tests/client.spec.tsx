@@ -4,7 +4,6 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { ApiError, caller, usePoll } from '../src/client/api.ts'
 import { apply } from '../src/client/index.tsx'
-import { readSuppressNative } from '../src/client/router-workspace.ts'
 import { zh } from '../src/client/locales.ts'
 import { SettingsSchema } from '../src/policy.ts'
 
@@ -52,10 +51,14 @@ const serve = () => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
 }))
 afterEach(() => { vi.unstubAllGlobals() })
 
-it('registers Superagent in Settings, keeps the main console and removes Router rail and footer entries', () => {
+it('registers Superagent in Settings, keeps the main console and puts the Router in the sidebar foot', () => {
   const { entries, dictionaries, main, settings, dispose } = fixture([])
-  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'settings.section', 'plugins.row.config'])
+  // The foot action is the Router's permanent door: the conversations themselves are listed natively by the sidebar, so
+  // this is navigation only, not a second list.
+  expect(entries.map(entry => entry.options.name))
+    .toEqual(['main', 'settings.section', 'plugins.row.config', 'sidebar.footer.action'])
   expect(entries[2]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
+  expect(entries[3]!.options).toMatchObject({ id: 'dsh-superagent', locale: 'dshSuperagent' })
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
   expect(settings.options).toMatchObject({ id: 'dsh-superagent', order: 36, locale: 'dshSuperagent' })
@@ -63,26 +66,21 @@ it('registers Superagent in Settings, keeps the main console and removes Router 
   dispose()
 })
 
-it('keeps Settings controls and closes Settings before opening the management console or locating the group', async () => {
+it('offers the management console from Settings, and no longer offers a locator for a group that does not exist', async () => {
   serve()
   window.localStorage.clear()
   const { ctx, settings, dispose } = fixture([])
   const close = vi.fn()
   const view = await render(settings, { t, close })
-  const checkbox = view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')!
-  expect(checkbox.checked).toBe(true)
-  await act(async () => { checkbox.click() })
-  expect(readSuppressNative()).toBe(false)
-  await act(async () => { checkbox.click() })
-  expect(readSuppressNative()).toBe(true)
+  // The Router's conversations are listed natively by the sidebar, so this page no longer hides rows and needs no
+  // switch for doing it: the only controls left are the console entry and the management actions themselves.
+  expect(view.container.querySelector('input[type="checkbox"]')).toBeNull()
+  // No locator either: there is no separately mounted group for it to locate. The label is gone from the dictionary, so
+  // this asserts on the rendered text rather than on a key that no longer exists.
+  expect(view.container.textContent).not.toContain('定位到')
   const consoleButton = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.superagentOpenConsole)!
   await act(async () => { consoleButton.click() })
-  expect(close).toHaveBeenCalledOnce()
   expect(ctx.layout.selectPanel).toHaveBeenCalledExactlyOnceWith('dsh-superagent')
-  expect(close.mock.invocationCallOrder[0]).toBeLessThan(ctx.layout.selectPanel.mock.invocationCallOrder[0]!)
-  const locate = [...view.container.querySelectorAll('button')].find(button => button.textContent === zh.routerWorkspaceEntry)!
-  await act(async () => { locate.click() })
-  expect(close).toHaveBeenCalledTimes(2)
   view.dispose()
   dispose()
 })

@@ -1,0 +1,10 @@
+{
+  "scope": "isolated DSH_HOME .ac7-verify, port 3095; production 3080 unchanged",
+  "observations": [
+    {"request": "DELETE sessions/<active-router>?confirm=true", "status":409, "code":"routerSession"},
+    {"request": "DELETE sessions/session-does-not-exist-1234?confirm=true", "status":409, "code":"notDeletable"},
+    {"request": "DELETE sessions/worker-64679681df0561403f76bc371c07413a?confirm=true", "status":409, "code":"notDeletable"},
+    {"request": "GET delegated-sessions", "total":0}
+  ],
+  "limitations": ["Unknown IDs are not evidence for existing foreign-session protection.", "Existing ordinary, forged-prefix, foreign-child, orphan and cyclic-header cases are covered by control.spec.ts with no archive side effects.", "No production historical session was deleted."]
+}

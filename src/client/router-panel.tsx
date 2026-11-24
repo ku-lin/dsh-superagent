@@ -1,17 +1,18 @@
-/** Superagent Settings: management-console entry, Router switch, group locator, row visibility and router conversations. */
+/** Superagent Settings: management-console entry, Router switch, Router conversations, and their refresh/delete actions. */
 import { useEffect, useState } from 'react'
 import type { RouterSwitch } from '../app/control.ts'
 import type { RouterSessionRow } from '../app/router-sessions.ts'
-import { ControlRefusal, deleteSession, loadRouterState, startRouter, stopRouter } from './router-control.ts'
-import { loadRouterSessions, readSuppressNative, revealRouterWorkspace, setSuppressNative } from './router-workspace.ts'
+import { ControlRefusal, deleteSession, loadManagedRouters, loadRouterState, refreshRouter, startRouter, stopRouter,
+  type ManagedRouterRow } from './router-control.ts'
+import { loadRouterSessions } from './router-sessions-client.ts'
 import { when, type T } from './text.ts'
 
 /** Props supplied by the Settings section: translator, close callback and navigation. */
 export interface RouterWorkspacePanelProps {
   readonly t: T
-  /** Close the Settings dialog before locating the sidebar group. */
+  /** Close the Settings dialog before leaving it. */
   readonly close: () => void
-  /** Open a Session in the conversation column, exactly as the group's rows do. */
+  /** Open a Session in the conversation column. */
   readonly openSession: (sessionId: string) => void
   /** Select the dsh-superagent management panel, registered in the main slot. */
   readonly openPanel: () => void
@@ -19,14 +20,15 @@ export interface RouterWorkspacePanelProps {
 
 /**
  * Render Superagent Settings and keep its Router list current.
+ *
+ * This page is where a Router is replaced or deleted. The conversations themselves are listed natively by the sidebar,
+ * in the group their own Workspace draws, so nothing on this page has to move or hide a row.
  * @param props - translator, Session opener and management-panel route.
  * @returns the page element.
  */
 export function RouterWorkspacePanel({ t, close, openSession, openPanel }: RouterWorkspacePanelProps) {
   const [rows, setRows] = useState<readonly RouterSessionRow[]>([])
   const [error, setError] = useState(false)
-  // The operator's own restore switch: off means every native row stays visible, incident or not.
-  const [suppress, setSuppress] = useState(readSuppressNative)
   // The Router switch, its reason field, and the refusal the last control write produced, if any.
   const [router, setRouter] = useState<RouterSwitch | undefined>(undefined)
   // The permanent Router conversation: it cannot delete itself, so its row offers no button.
@@ -35,6 +37,9 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
   const [busy, setBusy] = useState(false)
   const [refused, setRefused] = useState<string | undefined>(undefined)
   const [deleted, setDeleted] = useState<string | undefined>(undefined)
+  // The Router this page's conversation is bound to, when the host has one: only a bound Router can archive to a project.
+  const [managed, setManaged] = useState<ManagedRouterRow[]>([])
+  const [refreshed, setRefreshed] = useState<string | undefined>(undefined)
   useEffect(() => {
     let live = true
     const load = (): void => {
@@ -42,6 +47,8 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
         () => { if (live) setError(true) })
       // A failed switch read leaves the previous value: the rows keep working without it.
       void loadRouterState().then(value => { if (live) { setRouter(value.router); setMasterId(value.masterId) } }, () => {})
+      // A host that predates managed Routers answers 404 here; the page then offers no refresh button instead of erroring.
+      void loadManagedRouters().then(items => { if (live) setManaged(items) }, () => { if (live) setManaged([]) })
     }
     load()
     const timer = setInterval(load, 4000)
@@ -67,6 +74,23 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
       setRefused(failure instanceof ControlRefusal || failure instanceof Error ? failure.message : String(failure))
     } finally { setBusy(false) }
   }
+  /** Archive this conversation and continue in a clean one; a refusal is shown in place, and nothing switches. */
+  const refresh = async (row: ManagedRouterRow): Promise<void> => {
+    if (!window.confirm(t('routerRefreshConfirm'))) return
+    setBusy(true); setRefused(undefined); setRefreshed(undefined)
+    try {
+      const outcome = await refreshRouter(row.routerId, row.sessionId, row.generation)
+      setRefreshed(`${t('routerRefreshDone')}: ${outcome.identity.sessionId} (${outcome.identity.generation})`)
+      // The Router group reads durable headers, so the new generation needs a re-read rather than a local append.
+      setRows(await loadRouterSessions())
+      setManaged(current => current.map(item => item.routerId === row.routerId ? outcome.identity : item))
+    } catch (failure) {
+      const code = failure instanceof ControlRefusal ? failure.code : undefined
+      const localized = code === 'sessionBusy' || code === 'sessionHeld' ? t('routerRefreshBusy')
+        : code === 'noWorkspace' ? t('routerRefreshUnbound') : undefined
+      setRefused(localized ?? (failure instanceof ControlRefusal || failure instanceof Error ? failure.message : String(failure)))
+    } finally { setBusy(false) }
+  }
   return <div className="dsr-page">
     <header className="dsr-page-head">
       <span className="dsr-glyph"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -75,9 +99,6 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
         <path d="M4.7 8h2.6" /><path d="M7.3 8 11.3 4.6" /><path d="M7.3 8l4 3.4" />
       </svg></span>
       <h2 className="dsr-page-title">{t('superagentSettings')}</h2>
-      <button type="button" className="dsr-page-locate" onClick={() => { close(); revealRouterWorkspace() }}>
-        {t('routerWorkspaceEntry')}
-      </button>
       <button type="button" className="dsr-page-locate" onClick={() => { openPanel() }}>
         {t('superagentOpenConsole')}
       </button>
@@ -112,13 +133,21 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
       {deleted ? <p className="dsr-page-note">{deleted}</p> : null}
     </section>
     <p className="dsr-page-hint">{t('routerWorkspaceHint')}</p>
-    {/* The restore switch: the person can always put every native row back, without waiting for a fix. */}
-    <label className="dsr-page-toggle">
-      <input type="checkbox" checked={suppress}
-        onChange={event => { const next = event.target.checked; setSuppress(next); setSuppressNative(next) }} />
-      {t('routerWorkspaceSuppress')}
-    </label>
-    <p className="dsr-page-hint">{t('routerWorkspaceSwitchHint')}</p>
+    {/* Archive-before-refresh: only a Router the host has bound to a project can archive, so an unbound one explains that. */}
+    <h3 className="dsr-page-subtitle">{t('routerRefreshTitle')}</h3>
+    <p className="dsr-page-hint">{t('routerRefreshHint')}</p>
+    {managed.length === 0
+      ? <p className="dsr-page-note">{t('routerRefreshUnbound')}</p>
+      : <ul className="dsr-page-list">{managed.map(row => <li key={row.routerId} className="dsr-row">
+          <span className="dsr-page-row-title">{row.projectId}</span>
+          <span className="dsr-ago">{row.sessionId} · {row.generation}</span>
+          <button type="button" className="dsr-page-locate" disabled={busy}
+            title={t('routerRefreshConfirm')} onClick={() => { void refresh(row) }}>
+            {t('routerRefresh')}
+          </button>
+        </li>)}</ul>}
+    {refreshed ? <p className="dsr-page-note">{refreshed}</p> : null}
+    {refused ? <p className="dsr-page-note">{t('routerRefreshFailed')}: {refused}</p> : null}
     <h3 className="dsr-page-subtitle">{t('routerDeleteTitle')}</h3>
     <p className="dsr-page-hint">{t('routerDeleteHint')}</p>
     {rows.length === 0
@@ -129,7 +158,8 @@ export function RouterWorkspacePanel({ t, close, openSession, openPanel }: Route
             <span className="dsr-page-row-title">{row.title ?? t('routerWorkspaceUntitled')}</span>
             <span className="dsr-ago">{when(new Date(row.updatedAt).toISOString(), t('lang'))}</span>
           </button>
-          {/* The Router's own conversation cannot delete itself; the host refuses it too, so the panel offers no button. */}
+          {/* The conversation serving as the Router cannot delete itself; a replaced, archived one can, and the host
+              refuses either way, so the page only hides the button for the live generation. */}
           {row.sessionId === masterId ? null : <button type="button" className="dsr-page-delete dsr-delete"
             disabled={busy} title={t('routerDeleteConfirm')} onClick={() => { void remove(row.sessionId) }}>
             {t('routerDelete')}

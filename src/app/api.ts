@@ -4,8 +4,9 @@ import type { DeleteReport, RouterSwitch } from './control.ts'
 import type { FailureKind, FailureRecord } from './failures.ts'
 import type { PromptConfig, Prompts } from './prompts.ts'
 import type { RouterSessionRow } from './router-sessions.ts'
-import type { PromptsView, StateView, TicketPageView } from './http.ts'
+import type { PromptsView, StateView, TicketPageView, ManagedRouterKnowledgeView } from './http.ts'
 import type { TasksView } from './tasks.ts'
+import type { RouterIdentity } from './router-registry.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
 import type { SettingsView } from './views/settings.ts'
@@ -68,6 +69,8 @@ export interface Api {
   'POST router/start': { response: RouterSwitch }
   /** Delete one worker or router-level conversation; the permanent Router conversation and other people's are refused. */
   'DELETE sessions/:id': { query?: { confirm?: string }; response: DeleteReport }
+  /** Subagent-origin conversations this deployment still holds; the manual cleanup list, never an automatic sweep. */
+  'GET delegated-sessions': { response: { items: { sessionId: string; updatedAt: number; running: boolean; title?: string }[]; total: number } }
   'GET router-events': { response: { counts: { type: string; count: number }[] } }
   'GET router-event-sample': { query?: { type?: string }; response: { found: string | null } }
   /**
@@ -106,9 +109,69 @@ export interface Api {
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }
 }
+/**
+ * The managed-Router knowledge routes, kept out of `Api` because that map is the panel's own route table: the web panel
+ * does not render these (no client code in this change), and a total map would force every panel fixture to answer routes
+ * no view calls. They are still same-origin management routes, typed here so a caller (a test, a script, or a later
+ * panel route) reads the exact shape the host answers.
+ *
+ * Every identity is explicit. `projectId` is matched against the Taskboard's stable project id — never a display name,
+ * the project key, or a Session's working directory — and `sessionId` on the read is the caller's own Session, checked
+ * against the Router's current generation by the registry.
+ */
+export interface ManagedRouterApi {
+  /**
+   * The Routers this host manages: one row per explicit Router/Project/Session binding. Read-only; `total` counts every
+   * binding, not a page. A host that composed no registry answers 503.
+   */
+  'GET managed-routers': { response: { items: { identity: RouterIdentity }[]; total: number } }
+  /**
+   * Bind a Router to a project and its first Session. The project must exist on the Taskboard (matched by stable id); an
+   * unknown project is a 404, an unreadable board a 503. Repeating the same triple is idempotent and answers
+   * `created: false`; a conflicting triple, or a Session another Router generation already holds, is a 409.
+   */
+  'POST managed-routers': {
+    body: { routerId: string; projectId: string; sessionId: string }
+    response: { identity: RouterIdentity; created: boolean }
+  }
+  /**
+   * One managed Router's project snapshot plus the single-use receipt a durable operation must present. `sessionId` is
+   * required: the registry verifies it is the Router's current generation, so a stale Session is a 409 instead of a read.
+   * `snapshot.revision` always equals `receipt.revision` (the route retries once and then answers 409 rather than return
+   * a receipt that cannot be used). A refresh in preparation, and an unbound Router, are 409s too; `params.sessionId`
+   * missing is a 400.
+   */
+  'GET managed-routers/:routerId/knowledge': {
+    query: { sessionId: string }
+    response: ManagedRouterKnowledgeView
+  }
+  /**
+   * Replace one Router's current Session with a fresh one, archiving the old log byte-exact first. `generation` is the
+   * generation the caller read: stating it is what makes a retried or stale request a 409 instead of a refresh of a
+   * conversation the caller never saw. `sourceId` is the deterministic identity of the archived prefix (a SHA-256 over
+   * the exact JSON-lines text plus the event count, the first/last sequence number and the byte length), so a caller can
+   * prove afterwards that the archive it reports is the one this refresh committed.
+   *
+   * Refusals are 409s and name what to do first — a running or undrained Session, an export that cannot be proven
+   * complete and flushed, a Router already preparing, and no Workspace for the replacement — while `generation` that is
+   * not a positive integer, or a missing `sessionId`, is a 400. An unexpected fault is a 500 and leaves the old Session,
+   * its history and its pointer untouched. Success publishes the `router` stream topic.
+   */
+  'POST managed-routers/:routerId/refresh': {
+    body: { sessionId: string; generation: number }
+    response: {
+      identity: RouterIdentity
+      /** How much conversation text moved into the archive: the Session it came from, its event count, and its bytes. */
+      archived: { sessionId: string; events: number; bytes: number }
+      sourceId: string
+    }
+  }
+}
+/** A managed-Router route name, for callers that dispatch by name rather than through the panel's `Api`. */
+export type ManagedRouterRoute = keyof ManagedRouterApi
 type Path<K> = K extends `${string} ${infer P}` ? P : never
 type Params<P> = P extends `${string}:${infer Name}/${infer Rest}` ? Record<Name, string> & Params<Rest>
   : P extends `${string}:${infer Name}` ? Record<Name, string> : unknown
-export type RouteParams<K extends keyof Api> = Params<Path<K>>
+export type RouteParams<K extends keyof Api | keyof ManagedRouterApi> = Params<Path<K>>
 export type ApiRequest<K extends keyof Api> = RouteParams<K> & Omit<Api[K], 'response'>
 export type ApiResponse<K extends keyof Api> = Api[K]['response']

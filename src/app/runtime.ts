@@ -2,8 +2,10 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-permission-presets'
@@ -34,10 +36,13 @@ import { FailureLog } from './failures.ts'
 import { StreamHub, type StreamTopic } from './stream.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, registerLockWaitHttp, registerStream, type HttpHost } from './http.ts'
+import { ProjectKnowledge } from './project-knowledge.ts'
+import { RouterRegistry } from './router-registry.ts'
+import { RouterSessionHost, refreshRouterSession, type RouterSessionIo } from './router-session-host.ts'
 import { TaskboardReader, taskboardDatabase } from './tasks.ts'
 import { Control, routerStopped, sessionRoot } from './control.ts'
 import { acquireStateLock, describeLock, lockPath, type LockAttempt, type LockPolicy, type LockRefusal } from './state-lock.ts'
-import { selectRouterSessions } from './router-sessions.ts'
+import { selectRouterSessions, sessionTitle } from './router-sessions.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -45,6 +50,7 @@ import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
+import { Patrol, PATROL_DEFAULTS } from './patrol.ts'
 import { Setup } from './setup.ts'
 import { feishuSettings } from '../sources/feishu.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
@@ -76,14 +82,49 @@ function streamTopicOf(event: DomainEvent): StreamTopic | undefined {
     default: return undefined
   }
 }
+/**
+ * The domain events that can change what the patrol would report.
+ *
+ * A ticket appearing, ending, or resuming changes its row; an assignment ending changes who is running.
+ * Nothing else does: a trigger arriving, an eval starting, a decision being recorded and a subscription
+ * moving all leave the patrol's four inputs alone, so asking it to look would only cost a scan.
+ */
+const PATROL_EVENTS = new Set<DomainEvent['type']>(['ticket.created', 'ticket.resumed', 'ticket.ended', 'assignment.started', 'assignment.ended'])
 /** Resolves a DSH session read within a couple of seconds, or fails loudly instead of leaving the panel loading forever. */
-async function bounded<T>(read: Promise<T>, what: string): Promise<T> {
+async function bounded<T>(read: Promise<T>, what: string, ms = 3000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} did not answer in time; retry once the running turn ends`)), 3000)
+    timer = setTimeout(() => reject(new Error(`${what} did not answer in time; retry once the running turn ends`)), ms)
   })
   try { return await Promise.race([read, timeout]) } finally { clearTimeout(timer) }
 }
+/**
+ * How long the stored-Session-header snapshot may take before the route answers its last good snapshot instead.
+ *
+ * `sessionPersistence.list()` reads the first frame of every stored log — 233 files and 164 MB on this machine — so it is
+ * a whole-corpus scan, not a metadata lookup, and it queues behind whatever else the host is doing. The panel polls it
+ * every 4 s; a scan that misses the deadline used to answer 500, and the client then hid nothing and said the Router rows
+ * were unreadable. The deadline is generous on purpose: a snapshot that arrives is worth far more than a fast failure.
+ */
+const ROUTER_SNAPSHOT_MS = 20_000
+/**
+ * How long a header snapshot stays usable for the next poll.
+ *
+ * The set of Router conversations changes only when one is created, refreshed or deleted, so re-reading the whole corpus
+ * on every poll is pure cost. Two seconds keeps the group live (a poll is 4 s) while collapsing the panel's own poll and
+ * any overlapping reader onto one scan.
+ */
+const ROUTER_SNAPSHOT_TTL_MS = 2000
+/**
+ * How long the DSH session-list snapshot stays usable, and how long one read of it may take.
+ *
+ * `sessionController.list()` is the cheaper of the two reads (the host walks its own query index rather than every log
+ * file), but it still yields between records and queues behind a running turn, so three routes asking for it in the same
+ * poll each paid for a full pass. One shared read per poll is enough for titles and recency; the TTL is shorter than the
+ * panel's 4 s poll so each poll still sees fresh data.
+ */
+const DSH_LIST_TTL_MS = 2000
+const DSH_LIST_MS = 15_000
 /** The router Session's first message: it makes the conversation visible in the workspace without waking the model. */
 const ROUTER_GREETING = '这是 dsh-superagent 的常驻 Router 对话。直接说「列出所有 worker」看它在指挥哪些对话，或说「让 <对话标题> 去做 <事情>」把指令发给某个 worker。'
 /** Its sidebar title: fixed, so the permanent conversation is recognizable and does not take a title from its first message. */
@@ -163,6 +204,24 @@ export class Runtime extends Service implements SourceHost {
   readonly passes!: Passes
   readonly control!: Control
   /**
+   * The silent patrol: it reads the tickets this process already stores and tells the Router, once, about
+   * a problem it has not been told about. Nothing about it is a second source of truth — the findings are
+   * derived from `Store` on every tick, and the only thing it keeps is the set it last reported.
+   */
+  readonly patrol!: Patrol
+  /**
+   * The managed-Router binding and its project knowledge. Neither exists before the database is open: a host waiting for
+   * another process's state directory lock has no store to bind into, and the three managed routes answer 503 there.
+   */
+  readonly knowledge?: ProjectKnowledge
+  readonly routers?: RouterRegistry
+  /**
+   * The DSH Session boundary an archive-before-refresh runs through: hold admission, export the complete flushed log,
+   * create a replacement without waking it, verify it, and summarize the archive. Optional for the same reason as the
+   * registry: it does no work until the database that records the binding exists.
+   */
+  readonly routerHost?: RouterSessionHost
+  /**
    * The Router panel's task list, read out of the Taskboard plugin's store. Built even while another process holds
    * the state directory: it needs no state of its own, and the panel then keeps its list instead of losing it.
    */
@@ -179,8 +238,29 @@ export class Runtime extends Service implements SourceHost {
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   /** The lock that could not be taken, when another process holds this machine's state directory. */
   readonly lockWait?: LockRefusal
-  masterId!: string
+  private initialMasterId!: string
+  get masterId(): string {
+    return this.routers?.successorOf(this.initialMasterId)?.sessionId ?? this.initialMasterId
+  }
   private readonly sourceLinks = new TextCache(200_000)
+  /**
+   * The last complete stored-Session-header snapshot the Router group was served from, and the scan still in flight.
+   *
+   * One scan feeds every reader: the panel polls the route, and a poll that arrives while a scan runs waits for that scan
+   * instead of starting a second one over the same corpus. A scan that fails leaves the previous snapshot in place, so a
+   * transient host hiccup degrades the rows' recency instead of emptying the group.
+   */
+  private routerHeaders?: { readonly at: number; readonly headers: readonly SessionHeader[] }
+  private routerHeadersScan?: Promise<readonly SessionHeader[]>
+  /**
+   * The last DSH session list, shared by every route that needs it, and the read still in flight.
+   *
+   * Separate from the header snapshot: the two reads come from different authorities (durable log headers vs the host's
+   * live catalog) and one may succeed while the other queues. A failed refresh keeps the previous list, so a busy host
+   * degrades recency instead of emptying a panel.
+   */
+  private dshList?: { readonly at: number; readonly items: readonly SessionSummary[] }
+  private dshListRead?: Promise<readonly SessionSummary[]>
   private readonly stopped = new AbortController()
   private readonly disposers: (() => void)[] = []
   private releaseLock?: () => Promise<void>
@@ -229,6 +309,10 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      // Project knowledge and the managed-Router registry share the one Store transaction boundary: a receipt is minted
+      // and consumed inside `store.atomic`, so an operation cannot commit against a snapshot that moved underneath it.
+      const knowledge = this.knowledge = new ProjectKnowledge(store)
+      const routers = this.routers = new RouterRegistry(store, knowledge)
       const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
@@ -238,8 +322,43 @@ export class Runtime extends Service implements SourceHost {
       // An installation from before this rule keeps its stored id only when it already has that form; otherwise it gets a new one.
       const stored = store.get(KV.runtime.masterId)
       const catalogued = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-      const masterId = this.masterId = stored && catalogued.test(stored) ? stored : `session-${randomUUID()}`
-      store.set(KV.runtime.masterId, masterId)
+      this.initialMasterId = stored && catalogued.test(stored) ? stored : `session-${randomUUID()}`
+      store.set(KV.runtime.masterId, this.initialMasterId)
+      // The Session boundary behind an archive-before-refresh. Built here, after the identity it reads is known, and
+      // before any route can ask it for one: a refresh that ran earlier would have no Router conversation to archive.
+      const routerHost = this.routerHost = new RouterSessionHost({
+        sessions: {
+          resolveAgent: async sessionId => {
+            const resolved = await ctx.sessionController.resolveAgent(sessionId as SessionId)
+            return 'error' in resolved ? { error: resolved.error } : { agent: resolved.agent }
+          },
+          // An export must not resume a cold Session: composing an Agent only to replace it would run setup for nothing.
+          liveAgent: sessionId => ctx.agents.get(sessionId as SessionId),
+          inspect: async sessionId => await ctx.sessionController.inspect(sessionId as SessionId),
+          create: async request => await ctx.sessionController.create({ sessionId: request.sessionId as SessionId,
+            workspaceId: request.workspaceId as never, agentPreset: request.agentPreset }),
+        } satisfies RouterSessionIo,
+        // DSH's own durability entry point: THE flush (the checkpoint policy uses it too), never a raw `session/flush`.
+        flush: session => ctx.sessions.flush(session as never),
+        persistence: { flush: () => ctx.sessionPersistence.flush(),
+          stat: async sessionId => await ctx.sessionPersistence.stat(sessionId as SessionId) },
+        /**
+         * The replacement joins the Workspace the Session it replaces runs in, found from that Session's own header
+         * rather than from the process directory: a deployment whose Router sits elsewhere must not stage its new
+         * generation in a folder the person never opened. The Workspace is created for that directory when none covers
+         * it, exactly as opening the directory would; a replaced Session with no `cwd` refuses instead of guessing.
+         */
+        workspace: async replacing => {
+          // `workspaceRegistry.list()` is synchronous (an in-memory table), so a failure here is a real refusal rather
+          // than a promise rejection; the try keeps an unavailable registry from breaking the refresh path silently.
+          let listed: readonly { readonly id: string; readonly path: string }[] = []
+          try { listed = ctx.workspaceRegistry.list() } catch { listed = [] }
+          const directory = ctx.agents.get(replacing as SessionId)?.session.header.cwd
+          if (directory === undefined) return undefined
+          return listed.find(item => sameDirectory(item.path, directory)) ?? await ctx.workspaceRegistry.create(directory)
+        },
+        logger: { warn: (message, ...args) => ctx.logger.warn(message, ...args) },
+      })
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)
@@ -252,13 +371,25 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId: this.masterId, context: ctx,
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
+      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId: this.masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), routerStopped: () => routerStopped(store),
+        // A managed (project) Router is decorated like the master one, but its authority comes from the registry rather
+        // than from the startup-captured id: a refresh replaces the Session, and the old one must lose its tools.
+        managedRouter: sessionId => {
+          const bound = routers.list().find(identity => identity.sessionId === sessionId)
+          return bound === undefined ? undefined : { projectId: bound.projectId, summary: knowledge.snapshot(bound.projectId).summary }
+        },
+        // Rechecked at execution time: a committed refresh makes the superseded Session's generation stale, and this is
+        // what stops it from acting on the project afterwards.
+        managedRouterAllowed: sessionId => routers.list().some(identity => identity.sessionId === sessionId),
         environment,
+        // Beside the state directory and outside the project's checkout: the Router talks about the deployment, so its
+        // conversation is not one of the deployment's own source-tree conversations.
+        routerDirectory: () => join(machine.stateDir, 'router-workspace'),
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       // The failure log exists before the executor, which records into it, and pushes each record to every open panel.
       const stream = this.stream
@@ -273,7 +404,7 @@ export class Runtime extends Service implements SourceHost {
         stream: topic => { stream.publish(topic) } })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
-        deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
+        deliver: (id, text) => sessions.prompt(this.masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
@@ -298,16 +429,27 @@ export class Runtime extends Service implements SourceHost {
           // commits. A rolled-back transaction announces nothing, which is why this waits for `afterCommit`.
           const topic = streamTopicOf(event)
           if (topic) store.afterCommit(() => { stream.publish(topic) })
+          // What the patrol watches moved: a ticket appeared, ended, resumed, or one of its assignments
+          // ended. Its own thresholds cover time; these are the changes a clock cannot predict.
+          if (PATROL_EVENTS.has(event.type)) store.afterCommit(() => { runtime.patrol?.request() })
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, ready: () => setup.ready(), closing: () => this.closing() })
+      // The silent patrol. It owns no timer of its own beyond the one it arms for the next threshold, and it
+      // never polls the model: `request()` is the only thing that can make it look sooner, so the domain
+      // events below are what keep it current between thresholds.
+      const patrol = this.patrol = new Patrol({ store, effects, health: board.claim('patrol', { state: 'ready', detail: 'Nothing to report' }),
+        stopped: () => routerStopped(store), closing: () => this.closing() }, PATROL_DEFAULTS)
       // The operator's control over the Router conversation: the stop/start switch, its audit trail, and deletions of the
       // conversations this plugin owns. It reads the switch from the store on every delivery, so a stop takes effect on the
       // next handoff and a start releases what the stop held.
-      this.control = new Control({ context: ctx, store, masterId, requestPass: () => { passes.request() },
+      this.control = new Control({ context: ctx, store, masterId: () => this.masterId, routers,
+        ownsWorker: id => store.tickets.list().some(ticket => workerSessionId(ticket.id) === id)
+          || store.keys(KV.sessions.directWorker).some(name => store.get(name as ReturnType<typeof KV.sessions.directWorker>)?.sessionId === id),
+        requestPass: () => { passes.request() },
         sessionRoot: () => sessionRoot(ctx) })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
       get deployment() { return setup.deployment }, configured: () => setup.configured(),
@@ -367,6 +509,67 @@ export class Runtime extends Service implements SourceHost {
     return part
   }
   private closing(): boolean { return this.closingFlag }
+  /**
+   * The stored Session headers, from a snapshot that is shared, reused and never thrown away by a failed read.
+   *
+   * `sessionPersistence.list()` scans the whole log corpus, so the Router group must not make every poll pay for it: a
+   * snapshot younger than {@link ROUTER_SNAPSHOT_TTL_MS} is reused, an in-flight scan is joined rather than duplicated,
+   * and a scan that misses {@link ROUTER_SNAPSHOT_MS} answers the previous snapshot when there is one. Only a first-ever
+   * read that times out fails, and that failure is reported as a failure — the client must never read it as "the Router
+   * has no conversations", because an empty list silently stops it hiding the duplicate rows.
+   */
+  private async routerHeaderSnapshot(): Promise<readonly SessionHeader[]> {
+    const cached = this.routerHeaders
+    if (cached !== undefined && Date.now() - cached.at < ROUTER_SNAPSHOT_TTL_MS) return cached.headers
+    const scan = this.routerHeadersScan ??= (async () => {
+      try {
+        const stored = await bounded(this.ctx.sessionPersistence.list(), 'the stored Session headers', ROUTER_SNAPSHOT_MS)
+        const headers = stored.map(snapshot => snapshot.header)
+        this.routerHeaders = { at: Date.now(), headers }
+        return headers
+      } finally { this.routerHeadersScan = undefined }
+    })()
+    try {
+      return await scan
+    } catch (error) {
+      // A stale snapshot beats no answer: the group keeps showing the conversations it last saw, and the next poll retries.
+      if (cached !== undefined) {
+        this.ctx.logger.warn('dsh-superagent served the previous Router snapshot: %s', String(error))
+        return cached.headers
+      }
+      throw error
+    }
+  }
+  /**
+   * The DSH session list, from one shared snapshot per poll instead of one full pass per caller.
+   *
+   * The Router panel asks three routes that all need this list (the group's rows, the panel's own list, and the Router
+   * chat's dispatch titles), so on a busy host each of them used to queue behind the host separately and each could time
+   * out on its own. Reuse is safe because the list is only ever read for titles and recency: the authority for what a
+   * conversation *is* stays the durable header in {@link routerHeaderSnapshot}.
+   */
+  private async dshSessionList(): Promise<readonly SessionSummary[]> {
+    const cached = this.dshList
+    if (cached !== undefined && Date.now() - cached.at < DSH_LIST_TTL_MS) return cached.items
+    const read = this.dshListRead ??= (async () => {
+      try {
+        const items = await bounded(this.ctx.sessionController.list({}, new AbortController().signal)
+          .then(listed => listed.items), 'the DSH session list', DSH_LIST_MS)
+        this.dshList = { at: Date.now(), items }
+        return items
+      } finally { this.dshListRead = undefined }
+    })()
+    try {
+      return await read
+    } catch (error) {
+      // As with the headers: a stale list beats no list, and the next poll retries rather than the route answering 500.
+      if (cached !== undefined) {
+        this.ctx.logger.warn('dsh-superagent served the previous DSH session list: %s', String(error))
+        return cached.items
+      }
+      throw error
+    }
+  }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
   /**
@@ -377,15 +580,23 @@ export class Runtime extends Service implements SourceHost {
    */
   private holds(): boolean { return !this.setup?.ready() || this.store.settings().paused }
   /**
-   * Makes the Router's own conversation openable from the panel: it must belong to a Workspace the client knows (the
-   * process working directory, not the plugin's state directory), and a Session with no message is hidden from the list,
-   * so it gets one opening message, injected without waking the model.
+   * Makes the Router's own conversation openable from the panel: it must belong to a Workspace the client knows, and a
+   * Session with no message is hidden from the list, so it gets one opening message, injected without waking the model.
+   *
+   * The Workspace is the Router's own directory rather than the process working directory. A Workspace accounts for a
+   * Session only when the Session's stored `cwd` equals the Workspace `path`, so a Router created in `process.cwd()` is
+   * accounted to the deployment's checkout — which is exactly what put the Router's row among the project's own
+   * conversations and forced the client to hide it with an injected rule instead of listing it where it belongs.
    */
   private async ensureRouterSession(): Promise<void> {
     try {
-      // The conversation must live in a Workspace the client already shows, or opening it reports the Session as unusable.
-      // `ensure` names only that Workspace: DSH takes the directory from `workspace.path`.
-      const workspace = await this.sessions.defaultWorkspace()
+      // Falls back to the default Workspace only when the Router's own directory cannot be registered at all: a Router
+      // accounted somewhere is still openable, which beats a conversation the panel cannot reach.
+      const own = await this.sessions.routerWorkspace().catch(error => {
+        this.ctx.logger.warn('dsh-superagent could not register its Router workspace: %s', String(error))
+        return undefined
+      })
+      const workspace = own ?? await this.sessions.defaultWorkspace()
       await this.sessions.ensure(this.masterId, ROUTER_TITLE, 'orchestrator', workspace?.id)
       if (this.store.get(KV.runtime.greeted) !== this.masterId) {
         // Queued, not injected: a Session whose only message waits for a turn is still a draft the client cannot open, and
@@ -441,35 +652,56 @@ export class Runtime extends Service implements SourceHost {
     this.executor.resume()
     this.passes.start()
     this.effects.start()
+    // Last: the patrol delivers through the effect queue, and a notice queued before the queue starts would
+    // wait there until something else kicked it. Its own first tick is what establishes the baseline, so a
+    // restart re-derives the same set and says nothing.
+    this.patrol.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
   private httpHost(): HttpHost {
     const runtime = this
-    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, ready, sourceLinks, setup, passes } = this
+    // `masterId` is read through a getter: a committed refresh moves the main Router to a new generation, and every
+    // route that names the Router must follow it rather than the identity this process captured at startup.
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, ready, sourceLinks,
+      get masterId() { return runtime.masterId },
       control: this.control, tasks: this.tasks, stream: this.stream,
+      // Read through getters on the runtime, not on this object: neither service exists until the database is open,
+      // which a host awaiting another process's lock never reaches.
+      get managed() {
+        const registry = runtime.routers, knowledge = runtime.knowledge, host = runtime.routerHost
+        if (!registry || !knowledge) return undefined
+        return { registry, knowledge,
+          // Absent (not failing) when the boundary was never built: the route then answers that refresh is unavailable
+          // instead of pretending the Router has no history to archive.
+          ...host ? { refresh: (routerId: string, sessionId: string, generation: number) =>
+            refreshRouterSession({ registry, host, routerId, sessionId, generation }) } : {} }
+      },
       // Read through a getter on the runtime, not on this object: the log is built once the database is open, which a
       // host awaiting another process's lock never reaches.
       get failures() { return runtime.failures },
       // DSH's session calls queue behind a running turn; a bounded read keeps the panel from showing an endless spinner.
-      listDshSessions: async () => bounded(this.ctx.sessionController.list({}, new AbortController().signal).then(listed => listed.items), 'the DSH session list'),
+      listDshSessions: async () => runtime.dshSessionList(),
       /** The router conversation's last exchanges, so the panel can show it as the permanent chat it is. */
       routerChat: async (limit: number) => {
         // DSH puts a message's blocks at `data.content`; an assistant reply may also arrive under `data.message`.
         type Blocks = readonly { type?: string; text?: string }[]
         type Shown = { type?: string; data?: { content?: Blocks; message?: { content?: Blocks }; name?: string; arguments?: string } }
-        const [events, listed] = await Promise.all([
-          bounded(runtime.ctx.sessionController.inspect(runtime.masterId as SessionId).then(found => found.events as readonly Shown[]), 'the router transcript'),
-          bounded(runtime.ctx.sessionController.list({}, new AbortController().signal).then(found => found.items), 'the DSH session list'),
-        ])
+        const events = await bounded(runtime.ctx.sessionController.inspect(runtime.masterId as SessionId)
+          .then(found => found.events as readonly Shown[]), 'the router transcript', DSH_LIST_MS)
+        // Titles only decorate a dispatch line, so a list the host would not answer leaves the replies intact rather than
+        // failing the whole transcript: the shared snapshot supplies it, and a cold failure degrades to no titles.
+        const listed = await runtime.dshSessionList().catch(() => [] as readonly SessionSummary[])
         const textOf = (blocks: Blocks | undefined): string =>
           (blocks ?? []).filter(block => block.type === 'text').map(block => block.text ?? '').join('\n').trim()
         // A worker dispatch is a `orchestrator_worker_message` tool call; it is shown under the reply that requested it.
         const titles = new Map<string, string>()
         for (const session of listed) {
-          const titled = session as typeof session & { title?: string; projectionValues?: { title?: string } }
-          const title = titled.title ?? titled.projectionValues?.title
-          if (title) titles.set(session.sessionId, title)
+          // `sessionTitle` reads all three seats DSH has used for a title; reading only the first two left every
+          // dispatched line blank for rows whose title lives under `projections.values.title`.
+          const title = sessionTitle(session as never)
+          const id = (session as { sessionId?: string }).sessionId
+          if (title && id) titles.set(id, title)
         }
         const items: { role: 'user' | 'assistant'; text: string; dispatched: string[] }[] = []
         // Injected background notices (time context, runtime reminders) are not things the person said.
@@ -499,13 +731,19 @@ export class Runtime extends Service implements SourceHost {
        * The virtual Router workspace's rows. Durable Session headers decide membership: the `agentPreset` projection
        * reads `standard` for the shipped 常驻 conversation although its header says `dsh-superagent-router`. The host
        * list supplies only titles and recency, so a slow list degrades the rows instead of failing the whole group.
+       *
+       * The headers come from a shared snapshot (see `routerHeaderSnapshot`): the panel polls this route, and a
+       * whole-corpus scan per poll is what used to answer 500 and leave the group hiding nothing.
        */
       routerSessions: async () => {
-        const stored = await bounded(runtime.ctx.sessionPersistence.list(), 'the stored Session headers')
-        const listed = await bounded(runtime.ctx.sessionController.list({}, new AbortController().signal)
-          .then(found => found.items), 'the DSH session list').catch(() => [])
+        const headers = await runtime.routerHeaderSnapshot()
+        // A cold failure of the list must not empty the group: the headers alone still decide membership, so the rows
+        // render with no title instead of the client hiding nothing.
+        const listed = await runtime.dshSessionList().catch(() => [] as readonly SessionSummary[])
+        // The Router's own directory tells the client which rows the sidebar already lists at home, so it only has to
+        // hide the duplicates of the ones that still live in a project Workspace.
         return { masterId: runtime.masterId,
-          items: selectRouterSessions(stored.map(snapshot => snapshot.header), listed, runtime.masterId) }
+          items: selectRouterSessions(headers, listed, runtime.masterId, runtime.sessions.routerDirectory()) }
       },
       /** Delivery shapes of the router transcript, so the panel and its tests can rely on the fields DSH really emits. */
       routerEventTypes: async () => {
@@ -542,6 +780,9 @@ export class Runtime extends Service implements SourceHost {
     if (this.lockWait) { for (const dispose of this.disposers.reverse()) dispose(); return }
     const passes = this.needs(this.passes).stop(); this.stopped.abort()
     try {
+      // The patrol's timer goes first and a tick in flight is waited for: it writes the store and closes
+      // nothing itself, but a tick still running while the database closed underneath it would throw.
+      await this.patrol?.dispose()
       this.assessor.stop()
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
